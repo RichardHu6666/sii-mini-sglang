@@ -21,6 +21,7 @@ import aiohttp
 from minisgl.benchmark.client import (
     BenchOneResult,
     BenchmarkResult,
+    RawResult,
     benchmark_one,
     benchmark_one_batch,
     generate_prompt,
@@ -38,14 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Mini-SGLang online benchmark")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host")
     parser.add_argument("--port", type=int, default=1919, help="Server port")
-    parser.add_argument("--concurrency", type=int, default=64, help="Number of concurrent requests")
-    parser.add_argument("--input-len", type=int, default=1024, help="Input sequence length")
-    parser.add_argument("--output-len", type=int, default=256, help="Output sequence length")
+    parser.add_argument("--concurrency", type=int, default=256, help="Number of concurrent requests")
+    parser.add_argument("--num-reqs", type=int, default=100, help="Number of requests to run (default: 100)")
+    parser.add_argument("--input-len", type=int, default=1024, help="Input sequence length (only used when --prompts=random)")
+    parser.add_argument("--output-len", type=int, default=1024, help="Output sequence length")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output-dir", type=str, default="./benchmark_results", help="Output directory for results")
     parser.add_argument("--metrics-interval", type=float, default=0.5, help="Interval in seconds to sample /metrics")
     parser.add_argument("--skip-metrics", action="store_true", help="Skip sampling /metrics endpoint")
     parser.add_argument("--model-path", type=str, default=None, help="Model path for tokenizer (auto-detected if not set)")
+    parser.add_argument("--prompts", type=str, default="./prompts.jsonl", choices=["./prompts.jsonl", "random"], help="Prompts source: ./prompts.jsonl (default) or random")
+    parser.add_argument("--prefix-ratio", type=float, default=0.0, help="Ratio of shared prefix in generated prompts (0.0-1.0). Only used when --prompts=random")
     return parser.parse_args()
 
 
@@ -252,6 +256,59 @@ class MetricsSampler:
         logger.info(f"Saved metrics plot to {plot_path}")
 
 
+async def run_with_semaphore(
+    client: OpenAI,
+    prompts: List[str],
+    output_lengths: List[int],
+    model: str,
+    concurrency: int,
+) -> List[RawResult]:
+    """
+    Run benchmark with dynamic concurrency control.
+    Keeps at most `concurrency` requests running at any time.
+    When one finishes, immediately start the next one.
+    """
+    import asyncio
+
+    results: List[RawResult] = []
+    next_index = 0  # Next prompt index to schedule
+    total = len(prompts)
+    lock = asyncio.Lock()  # Shared lock for task distribution
+    completed = 0
+
+    async def run_one(index: int) -> RawResult:
+        """Run a single request."""
+        nonlocal completed
+        prompt = prompts[index]
+        output_len = output_lengths[index]
+        result = await benchmark_one(client, prompt, output_len, model, pbar=False)
+        completed += 1
+        if completed % 10 == 0 or completed == total:
+            logger.info(f"Progress: {completed}/{total} requests completed")
+        return result
+
+    async def worker():
+        """Worker that processes tasks from the shared queue."""
+        nonlocal next_index
+        while True:
+            # Claim the next task atomically
+            async with lock:
+                if next_index >= total:
+                    return
+                current_index = next_index
+                next_index += 1
+
+            # Run the request (outside lock to allow concurrency)
+            result = await run_one(current_index)
+            results.append(result)
+
+    # Start worker tasks - use concurrency number of workers
+    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+    await asyncio.gather(*workers)
+
+    return results
+
+
 async def main():
     args = parse_args()
 
@@ -287,20 +344,70 @@ async def main():
                 logger.warning(f"Make sure the server is running on http://{args.host}:{args.port}")
                 raise e
 
-            # Generate test messages
+            # Prepare prompts
             concurrency = args.concurrency
+            num_reqs = args.num_reqs
             input_len = args.input_len
             output_len = args.output_len
+            prefix_ratio = args.prefix_ratio
 
-            messages = []
-            for _ in range(concurrency):
-                length = random.randint(max(1, input_len // 2), input_len)
-                message = generate_prompt(tokenizer, length)
-                messages.append(message)
+            # Load prompts from file or generate randomly
+            if args.prompts == "random":
+                # Generate random prompts with optional shared prefix
+                if prefix_ratio > 0:
+                    # Generate prompts with shared prefix for testing prefix cache
+                    shared_prefix_len = int(input_len * prefix_ratio)
+                    unique_suffix_len = input_len - shared_prefix_len
 
-            output_lengths = [random.randint(max(1, output_len // 2), output_len) for _ in range(concurrency)]
-            logger.info(f"Generated {len(messages)} test messages")
-            logger.info(f"Input length: ~{input_len} tokens, Output length: ~{output_len} tokens")
+                    # Generate shared prefix (same for all prompts)
+                    shared_prefix = generate_prompt(tokenizer, shared_prefix_len)
+
+                    logger.info(f"Generating prompts with {prefix_ratio*100:.0f}% shared prefix "
+                               f"({shared_prefix_len} tokens prefix, {unique_suffix_len} tokens suffix)")
+
+                    # Generate unique suffix for each request
+                    messages = []
+                    for _ in range(num_reqs):
+                        suffix = generate_prompt(tokenizer, unique_suffix_len)
+                        message = shared_prefix + suffix
+                        messages.append(message)
+
+                    logger.info(f"Generated {len(messages)} prompts with shared prefix")
+                else:
+                    # Generate completely random prompts
+                    messages = []
+                    for _ in range(num_reqs):
+                        length = random.randint(max(1, input_len // 2), input_len)
+                        message = generate_prompt(tokenizer, length)
+                        messages.append(message)
+                    logger.info(f"Generated {len(messages)} test messages")
+
+                logger.info(f"Input length: ~{input_len} tokens")
+                all_prompts = messages
+            else:
+                # Load from ./prompts.jsonl
+                prompts_path = Path(args.prompts)
+                if not prompts_path.exists():
+                    logger.error(f"Prompts file not found: {prompts_path}")
+                    return
+                with open(prompts_path, "r") as f:
+                    file_prompts = [json.loads(line)["prompt"] for line in f if line.strip()]
+
+                # Use first num_reqs prompts, or all if file has fewer
+                if len(file_prompts) >= num_reqs:
+                    all_prompts = file_prompts[:num_reqs]
+                    logger.info(f"Loaded {num_reqs} prompts from {prompts_path} (first {num_reqs} of {len(file_prompts)})")
+                else:
+                    all_prompts = file_prompts
+                    logger.warning(f"prompts.jsonl has only {len(file_prompts)} prompts, using all of them (requested {num_reqs})")
+
+            # Generate output lengths
+            total_prompts = len(all_prompts)
+            all_output_lengths = [random.randint(max(1, output_len // 2), output_len) for _ in range(total_prompts)]
+
+            logger.info(f"Output length: ~{output_len} tokens")
+            logger.info(f"Total prompts to run: {total_prompts}")
+            logger.info(f"Max concurrency: {concurrency}")
 
             # Start metrics sampling
             metrics_sampler = None
@@ -310,8 +417,9 @@ async def main():
 
             logger.info("Running benchmark...")
             try:
-                results = await benchmark_one_batch(
-                    client, messages, output_lengths, MODEL
+                # Run with dynamic concurrency control
+                results = await run_with_semaphore(
+                    client, all_prompts, all_output_lengths, MODEL, concurrency
                 )
 
                 # Process and display results
@@ -329,6 +437,9 @@ async def main():
                         "seed": args.seed,
                         "model": MODEL,
                         "timestamp": timestamp,
+                        "prompts_source": args.prompts,
+                        "prefix_ratio": prefix_ratio if args.prompts == "random" else None,
+                        "total_requests": len(results),
                     },
                     "results": calculate_metrics(results),
                 }

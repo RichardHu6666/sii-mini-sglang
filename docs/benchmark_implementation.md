@@ -318,15 +318,58 @@ fig, axes = plt.subplots(num_groups, 1, figsize=(14, 5 * num_groups))
 
 ### 5.1 运行 Benchmark
 
+**默认行为（使用 ./prompts.jsonl）**：
+
 ```bash
 python benchmark/online/bench_simple.py \
     --host 127.0.0.1 \
     --port 1919 \
-    --concurrency 64 \
+    --concurrency 256 \
+    --output-len 256 \
+    --output-dir ./benchmark_results
+```
+
+脚本会读取 `./prompts.jsonl` 中的所有 prompts，使用信号量控制并发，始终保持最多 `--concurrency` 个请求同时运行。当一个请求结束时，立刻启动下一个请求，直到跑完所有数据。
+
+**使用随机生成的 prompts**：
+
+```bash
+python benchmark/online/bench_simple.py \
+    --host 127.0.0.1 \
+    --port 1919 \
+    --prompts random \
+    --concurrency 256 \
     --input-len 1024 \
     --output-len 256 \
     --output-dir ./benchmark_results
 ```
+
+随机模式只跑 `--concurrency` 个请求。
+
+**使用共享前缀的 prompts（测试 prefix cache）**：
+
+```bash
+python benchmark/online/bench_simple.py \
+    --host 127.0.0.1 \
+    --port 1919 \
+    --prompts random \
+    --concurrency 256 \
+    --input-len 1024 \
+    --prefix-ratio 0.8 \
+    --output-len 256 \
+    --output-dir ./benchmark_results
+```
+
+上述命令会生成所有 prompts 共享 80% 相同前缀的数据集，用于测试 prefix cache 的命中率。
+
+**注意**：
+- `--prompts` 参数只有两个取值：`./prompts.jsonl`（默认）和 `random`
+- `--input-len` 和 `--prefix-ratio` 参数仅在 `--prompts=random` 时生效
+- 使用 `--prefix-ratio` 可以控制随机生成 prompts 的共享前缀比例（0.0-1.0），用于测试 prefix cache
+- 默认情况下，脚本会从 `./prompts.jsonl` 读取 prompts，该文件应存在于工作目录中
+- 使用 `./prompts.jsonl` 时，脚本使用信号量控制并发，始终保持最多 `--concurrency` 个请求同时运行
+- 使用 `random` 时，脚本只跑 `--concurrency` 个请求
+- 每完成 10 个请求会输出一次进度日志
 
 ### 5.2 生成可视化图表
 
