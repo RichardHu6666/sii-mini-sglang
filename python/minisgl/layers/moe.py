@@ -55,6 +55,8 @@ class MoELayer(BaseOP):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
         )
-        if self.tp_size > 1:
+        # EP mode already routes expert outputs back to token owners.
+        # Keep TP all-reduce only for non-EP tensor-parallel MoE.
+        if self.tp_size > 1 and self.ep_size == 1:
             final_hidden_states = self._comm.all_reduce(final_hidden_states)
         return final_hidden_states
