@@ -91,15 +91,13 @@ def ep_all_to_all(
     input: torch.Tensor,
     output_split_sizes: List[int],
     input_split_sizes: List[int],
-    async_op: bool = False,
-) -> dist.Work | None:
-    return dist.all_to_all_single(
+) -> None:
+    dist.all_to_all_single(
         output,
         input,
         output_split_sizes=output_split_sizes,
         input_split_sizes=input_split_sizes,
         group=_EP_GROUP,
-        async_op=async_op,
     )
 # 启用pynccl
 def enable_pynccl_distributed(

@@ -289,12 +289,13 @@ def _adjust_config(config: EngineConfig):
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
-    ## ep约束
+    ## ep约束 关闭cuda graph
     if config.ep_size > 1:
         assert config.model_config.is_moe, "EP needs MoE models"
         assert config.model_config.num_experts % config.ep_size == 0, (
             f"num of experts ({config.model_config.num_experts})"
             f"must be divisible by ep size ({config.ep_size})"
         )
-        if config.cuda_graph_max_bs is not None and config.cuda_graph_max_bs < 0:
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs> 0:
             override("cuda_graph_max_bs", 0)
+            logger.info_rank0("CUDA graphs disabled by ep mode")
