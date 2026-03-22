@@ -43,6 +43,12 @@ class EPMoe(BaseMoeBackend):
         num_tokens, hidden_size = hidden_states.shape
         num_local_experts = w1.shape[0]
         num_pairs = num_tokens * topk
+        small_packet_threshold = int(ENV.EP_SMALL_PACKET_THRESHOLD.value)
+        use_small_packet_sync = (
+            small_packet_threshold > 0
+            and num_pairs <= small_packet_threshold
+            and bool(ENV.EP_SMALL_PACKET_SYNC)
+        )
         # 选择topk expert
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
@@ -109,7 +115,7 @@ class EPMoe(BaseMoeBackend):
                 gathered_counts,
                 send_counts,
                 group=get_ep_group(),
-                async_op=True,
+                async_op=not use_small_packet_sync,
             )
             if work_counts is not None:
                 work_counts.wait()
@@ -127,7 +133,7 @@ class EPMoe(BaseMoeBackend):
                 send_hidden,
                 recv_splits,
                 send_splits,
-                async_op=True,
+                async_op=not use_small_packet_sync,
             )
             # 交换expert id
             work_ids = ep_all_to_all(
@@ -135,7 +141,7 @@ class EPMoe(BaseMoeBackend):
                 sorted_local_ids,
                 recv_splits,
                 send_splits,
-                async_op=True,
+                async_op=not use_small_packet_sync,
             )
             if work_hidden is not None:
                 work_hidden.wait()
@@ -172,7 +178,7 @@ class EPMoe(BaseMoeBackend):
                 local_out,
                 send_splits,
                 recv_splits,
-                async_op=True,
+                async_op=not use_small_packet_sync,
             )
             if work_combined is not None:
                 work_combined.wait()

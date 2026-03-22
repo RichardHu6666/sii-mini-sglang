@@ -69,6 +69,10 @@ class EnvClassSingleton:
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
     EP_PROFILE = EnvBool(False)
     EP_PROFILE_INTERVAL = EnvInt(50)
+    # EP small-packet path is disabled by default.
+    # Set MINISGL_EP_SMALL_PACKET_THRESHOLD > 0 to enable size-based switching.
+    EP_SMALL_PACKET_THRESHOLD = EnvInt(0)
+    EP_SMALL_PACKET_SYNC = EnvBool(True)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     def __new__(cls):
