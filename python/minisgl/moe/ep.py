@@ -51,33 +51,38 @@ class EPMoe(BaseMoeBackend):
         flat_ids = topk_ids.view(-1)
         dest_rank = flat_ids.to(torch.int64) // num_local_experts
         local_ids = (flat_ids % num_local_experts).to(torch.int32)
-        send_counts = torch.bincount(dest_rank, minlength=ep_size)
-        recv_counts = self._get_buffer(
-            (device, send_counts.dtype, "recv_counts"),
-            (ep_size,),
+
+        # 按(目标rank, 本地expert)分桶，便于后续在接收端重建expert id
+        route_key = dest_rank * num_local_experts + local_ids.to(torch.int64)
+        token_idx = torch.arange(num_pairs, device=device, dtype=torch.int64) // topk
+        sort_idx = torch.argsort(route_key)
+        sorted_token_idx = token_idx[sort_idx]
+        send_hidden = hidden_states[sorted_token_idx].contiguous()
+
+        # 交换每个目标rank上的expert计数（小消息），避免再发送逐token expert id
+        send_expert_counts = torch.bincount(
+            route_key,
+            minlength=ep_size * num_local_experts,
+        ).view(ep_size, num_local_experts)
+        send_counts = send_expert_counts.sum(dim=1)
+        recv_expert_counts = self._get_buffer(
+            (device, send_expert_counts.dtype, "recv_expert_counts"),
+            (ep_size, num_local_experts),
         )
         work_counts = dist.all_to_all_single(
-            recv_counts,
-            send_counts,
+            recv_expert_counts,
+            send_expert_counts,
             group=get_ep_group(),
             async_op=True,
         )
-
-        # 排序token
-        token_idx = torch.arange(num_pairs, device=device, dtype=torch.int64) // topk
-        sort_idx = torch.argsort(dest_rank)
-        sorted_token_idx = token_idx[sort_idx]
-        sorted_local_ids = local_ids[sort_idx]
-        send_hidden = hidden_states[sorted_token_idx].contiguous()
-
         work_counts.wait()
-        # 交换hidden state
+
+        recv_counts = recv_expert_counts.sum(dim=1)
         send_splits = send_counts.tolist()
         recv_splits = recv_counts.tolist()
         total_recv = sum(recv_splits)
 
         recv_hidden = hidden_states.new_empty(total_recv, hidden_size)
-        recv_ids = sorted_local_ids.new_empty(total_recv)
         work_hidden = ep_all_to_all(
             recv_hidden,
             send_hidden,
@@ -85,17 +90,20 @@ class EPMoe(BaseMoeBackend):
             send_splits,
             async_op=True,
         )
-        work_ids = ep_all_to_all(
-            recv_ids,
-            sorted_local_ids,
-            recv_splits,
-            send_splits,
-            async_op=True,
-        )
         if work_hidden is not None:
             work_hidden.wait()
-        if work_ids is not None:
-            work_ids.wait()
+
+        # 接收顺序是source-rank主序，在每个source段内按expert id分组
+        if total_recv > 0:
+            expert_template = (
+                torch.arange(num_local_experts, device=device, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(ep_size, -1)
+                .reshape(-1)
+            )
+            recv_ids = torch.repeat_interleave(expert_template, recv_expert_counts.reshape(-1))
+        else:
+            recv_ids = local_ids.new_empty(0)
 
         # 本地expert 计算
         if total_recv > 0:
