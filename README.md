@@ -178,6 +178,34 @@ Test Configuration:
 
 See [benchmark_qwen.py](./benchmark/online/bench_qwen.py) for more details.
 
+For a controlled EP-vs-non-EP A/B experiment (same model, same prompts, same load), use:
+
+```bash
+python benchmark/online/compare_ep_ab.py \
+   --model "/path/to/Qwen3-30B" \
+   --tp 4 \
+   --base-port 1919 \
+   --exp-port 1920 \
+   --num-prompts 64 \
+   --input-len 512 \
+   --output-len 128 \
+   --concurrency 32
+```
+
+To keep the run alive after terminal disconnect, use the background wrapper:
+
+```bash
+bash benchmark/online/run_compare_ep_ab.sh \
+   --model "/path/to/Qwen3-30B" \
+   --tp 4 \
+   --num-prompts 64 \
+   --input-len 512 \
+   --output-len 128 \
+   --concurrency 32
+```
+
+Reports and logs are written under `benchmark/online/results/`.
+
 Test Configuration:
 
 - Hardware: 4xH200 GPU, connected by NVLink.
