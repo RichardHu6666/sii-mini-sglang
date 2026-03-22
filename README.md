@@ -19,6 +19,7 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
   - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
   - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
   - **Tensor Parallelism**: Scales inference across multiple GPUs.
+   - **Expert Parallelism (MoE)**: Distributes experts across GPUs for MoE inference.
   - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
   - ...
 
@@ -120,6 +121,10 @@ python -m minisgl --model "Qwen/Qwen3-0.6B"
 
 # Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
 python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
+
+# Deploy Qwen3 MoE with Expert Parallelism on 4 GPUs
+# Note: ep-size must be 1 or equal to tp-size.
+python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --ep-size 4 --moe-backend ep
 ```
 
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
