@@ -37,7 +37,9 @@ class EPMoe(BaseMoeBackend):
             ev_end = torch.cuda.Event(enable_timing=True)
             ev_start.record()
 
-        ep_size = get_ep_info().size
+        ep_info = get_ep_info()
+        ep_size = ep_info.size
+        ep_rank = ep_info.rank
         num_tokens, hidden_size = hidden_states.shape
         num_local_experts = w1.shape[0]
         num_pairs = num_tokens * topk
@@ -68,45 +70,118 @@ class EPMoe(BaseMoeBackend):
         send_counts = torch.bincount(dest_rank, minlength=ep_size)
         if do_profile and ev_route_end is not None:
             ev_route_end.record()
-        
-        recv_counts = torch.empty_like(send_counts)
-        dist.all_to_all_single(recv_counts, send_counts, group=get_ep_group())
-        # 交换hidden state
-        send_splits = send_counts.tolist()
-        recv_splits = recv_counts.tolist()
-        total_recv = sum(recv_splits)
 
-        recv_hidden = hidden_states.new_empty(total_recv, hidden_size)
-        ep_all_to_all(recv_hidden, send_hidden, recv_splits, send_splits)
-        # 交换expert id
-        recv_ids = sorted_local_ids.new_empty(total_recv)
-        ep_all_to_all(recv_ids, sorted_local_ids, recv_splits, send_splits)
-        if do_profile and ev_comm_dispatch_end is not None:
-            ev_comm_dispatch_end.record()
+        # Control plane: use all_gather for tiny count metadata to reduce jitter.
+        # gathered[src_rank, dst_rank] = count sent from src_rank to dst_rank
+        gathered_counts = torch.empty(
+            (ep_size, ep_size),
+            dtype=send_counts.dtype,
+            device=send_counts.device,
+        )
+        work_counts = dist.all_gather_into_tensor(
+            gathered_counts,
+            send_counts,
+            group=get_ep_group(),
+            async_op=True,
+        )
+        if work_counts is not None:
+            work_counts.wait()
+        recv_counts = gathered_counts[:, ep_rank].contiguous()
 
-        # 本地expert 计算
-        if total_recv > 0:
+        # Fast path: all routed experts are local, skip all communication.
+        if int(send_counts[ep_rank].item()) == num_pairs:
             unit_weights = torch.ones(
-                total_recv, 1, dtype=torch.float32, device=hidden_states.device
+                num_pairs,
+                1,
+                dtype=torch.float32,
+                device=hidden_states.device,
             )
             local_out = fused_experts_impl(
-                recv_hidden,
+                send_hidden,
                 w1,
                 w2,
                 unit_weights,
-                recv_ids.unsqueeze(1),
+                sorted_local_ids.unsqueeze(1),
                 activation=activation,
                 apply_router_weight_on_input=False,
             )
+            if do_profile and ev_comm_dispatch_end is not None:
+                ev_comm_dispatch_end.record()
+            if do_profile and ev_compute_end is not None:
+                ev_compute_end.record()
+            combined = local_out
+            if do_profile and ev_comm_combine_end is not None:
+                ev_comm_combine_end.record()
         else:
-            local_out = hidden_states.new_empty(0, hidden_size)
-        if do_profile and ev_compute_end is not None:
-            ev_compute_end.record()
+        # 交换hidden state
+            send_splits = send_counts.tolist()
+            recv_splits = recv_counts.tolist()
+            total_recv = sum(recv_splits)
 
-        combined = hidden_states.new_empty(num_pairs, hidden_size)
-        ep_all_to_all(combined, local_out, send_splits, recv_splits)
-        if do_profile and ev_comm_combine_end is not None:
-            ev_comm_combine_end.record()
+            recv_hidden = hidden_states.new_empty(total_recv, hidden_size)
+            recv_ids = sorted_local_ids.new_empty(total_recv)
+            work_hidden = ep_all_to_all(
+                recv_hidden,
+                send_hidden,
+                recv_splits,
+                send_splits,
+                async_op=True,
+            )
+            # 交换expert id
+            work_ids = ep_all_to_all(
+                recv_ids,
+                sorted_local_ids,
+                recv_splits,
+                send_splits,
+                async_op=True,
+            )
+            if work_hidden is not None:
+                work_hidden.wait()
+            if work_ids is not None:
+                work_ids.wait()
+            if do_profile and ev_comm_dispatch_end is not None:
+                ev_comm_dispatch_end.record()
+
+            # 本地expert 计算
+            if total_recv > 0:
+                unit_weights = torch.ones(
+                    total_recv,
+                    1,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                local_out = fused_experts_impl(
+                    recv_hidden,
+                    w1,
+                    w2,
+                    unit_weights,
+                    recv_ids.unsqueeze(1),
+                    activation=activation,
+                    apply_router_weight_on_input=False,
+                )
+            else:
+                local_out = hidden_states.new_empty(0, hidden_size)
+            if do_profile and ev_compute_end is not None:
+                ev_compute_end.record()
+
+            combined = hidden_states.new_empty(num_pairs, hidden_size)
+            work_combined = ep_all_to_all(
+                combined,
+                local_out,
+                send_splits,
+                recv_splits,
+                async_op=True,
+            )
+            if work_combined is not None:
+                work_combined.wait()
+            if do_profile and ev_comm_combine_end is not None:
+                ev_comm_combine_end.record()
+
+            # keep for profiling logs below
+            total_recv = total_recv
+
+        if int(send_counts[ep_rank].item()) == num_pairs:
+            total_recv = num_pairs
 
         # 恢复token顺序 加权输出
         result = hidden_states.new_empty(num_pairs, hidden_size)
