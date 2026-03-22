@@ -71,25 +71,9 @@ class EPMoe(BaseMoeBackend):
         if do_profile and ev_route_end is not None:
             ev_route_end.record()
 
-        # Control plane: use all_gather for tiny count metadata to reduce jitter.
-        # gathered[src_rank, dst_rank] = count sent from src_rank to dst_rank
-        gathered_counts = torch.empty(
-            (ep_size, ep_size),
-            dtype=send_counts.dtype,
-            device=send_counts.device,
-        )
-        work_counts = dist.all_gather_into_tensor(
-            gathered_counts,
-            send_counts,
-            group=get_ep_group(),
-            async_op=True,
-        )
-        if work_counts is not None:
-            work_counts.wait()
-        recv_counts = gathered_counts[:, ep_rank].contiguous()
-
         # Fast path: all routed experts are local, skip all communication.
-        if int(send_counts[ep_rank].item()) == num_pairs:
+        local_only = int(send_counts[ep_rank].item()) == num_pairs
+        if local_only:
             unit_weights = torch.ones(
                 num_pairs,
                 1,
@@ -112,8 +96,26 @@ class EPMoe(BaseMoeBackend):
             combined = local_out
             if do_profile and ev_comm_combine_end is not None:
                 ev_comm_combine_end.record()
+            total_recv = num_pairs
         else:
-        # 交换hidden state
+            # Control plane: use all_gather for tiny count metadata to reduce jitter.
+            # gathered[src_rank, dst_rank] = count sent from src_rank to dst_rank
+            gathered_counts = torch.empty(
+                (ep_size, ep_size),
+                dtype=send_counts.dtype,
+                device=send_counts.device,
+            )
+            work_counts = dist.all_gather_into_tensor(
+                gathered_counts,
+                send_counts,
+                group=get_ep_group(),
+                async_op=True,
+            )
+            if work_counts is not None:
+                work_counts.wait()
+            recv_counts = gathered_counts[:, ep_rank].contiguous()
+
+            # 交换hidden state
             send_splits = send_counts.tolist()
             recv_splits = recv_counts.tolist()
             total_recv = sum(recv_splits)
@@ -176,12 +178,6 @@ class EPMoe(BaseMoeBackend):
                 work_combined.wait()
             if do_profile and ev_comm_combine_end is not None:
                 ev_comm_combine_end.record()
-
-            # keep for profiling logs below
-            total_recv = total_recv
-
-        if int(send_counts[ep_rank].item()) == num_pairs:
-            total_recv = num_pairs
 
         # 恢复token顺序 加权输出
         result = hidden_states.new_empty(num_pairs, hidden_size)
