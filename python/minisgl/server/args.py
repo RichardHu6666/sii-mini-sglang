@@ -218,6 +218,15 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--quantization",
+        "--quant",
+        type=str,
+        default=None,
+        choices=["int8", "none"],
+        help="Quantization method for model weights. 'int8' enables dynamic int8 quantization.",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
@@ -259,6 +268,11 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "float32": torch.float32,
     }
     kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
+
+    # Handle quantization argument
+    quant = kwargs.pop("quantization")
+    kwargs["quantization"] = None if quant == "none" else quant
+
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

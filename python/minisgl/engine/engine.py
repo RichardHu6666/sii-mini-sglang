@@ -143,7 +143,20 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
+            # Load weights and apply dynamic quantization if requested
+            state_dict = {}
+            for k, v in load_weight(config.model_path, self.device):
+                v = v.to(self.dtype)
+
+                # Apply dynamic int8 quantization if requested
+                if config.quantization == "int8" and _should_quantize(k):
+                    # Quantize weight to int8 and store scale separately
+                    qweight, scale = _dynamic_quantize_int8_per_channel(v)
+                    state_dict[k.replace(".weight", ".qweight")] = qweight
+                    state_dict[k.replace(".weight", ".scale")] = scale
+                else:
+                    state_dict[k] = v
+            return state_dict
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
@@ -213,6 +226,53 @@ class Engine:
 
 def _align_up_32(num: int) -> int:
     return (num + 31) // 32 * 32
+
+
+def _dynamic_quantize_int8_per_channel(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Perform per-channel dynamic int8 quantization on weight tensor.
+
+    Args:
+        weight: 2D weight tensor of shape (out_features, in_features) in fp16/bf16/fp32
+
+    Returns:
+        qweight: int8 quantized weight
+        scale: per-channel scale factor (out_features,)
+    """
+    assert weight.dim() == 2, f"Expected 2D weight, got {weight.dim()}D"
+
+    # Compute per-channel (row-wise) min/max
+    min_val = weight.min(dim=1, keepdim=True)[0]
+    max_val = weight.max(dim=1, keepdim=True)[0]
+
+    # Compute scale: scale = max(|min|, |max|) / 127
+    eps = torch.finfo(torch.float32).eps
+    max_abs = torch.maximum(-min_val, max_val)
+    scale = max_abs / 127.0
+    scale = torch.clamp(scale, min=eps)
+
+    # Quantize: q = round(w / scale) and clamp to [-127, 127]
+    qweight = torch.round(weight / scale)
+    qweight = torch.clamp(qweight, -127, 127).to(torch.int8)
+
+    # Return scale as 1D tensor
+    scale = scale.squeeze(dim=1)
+
+    return qweight, scale
+
+
+def _should_quantize(name: str) -> bool:
+    """Check if a weight tensor should be quantized.
+
+    We quantize linear layer weights but not norms, embeddings, etc.
+    """
+    # Quantize projection layers
+    quantize_suffixes = [
+        ".qkv_proj.weight", ".q_proj.weight", ".k_proj.weight", ".v_proj.weight",
+        ".o_proj.weight", ".gate_proj.weight", ".up_proj.weight", ".down_proj.weight",
+        ".gate_up_proj.weight", ".lm_head.weight",
+    ]
+    return any(name.endswith(suffix) for suffix in quantize_suffixes)
 
 
 def _adjust_config(config: EngineConfig):

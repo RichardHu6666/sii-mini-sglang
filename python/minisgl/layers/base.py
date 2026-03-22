@@ -23,9 +23,18 @@ class BaseOP:
             if name.startswith("_"):
                 continue
             if isinstance(param, torch.Tensor):
+                # Skip weight if quantized (qweight will be added separately)
+                if name == "weight" and self.__dict__.get("qweight") is not None:
+                    continue
                 result[_concat_prefix(prefix, name)] = param
             elif isinstance(param, BaseOP):
                 param.state_dict(prefix=_concat_prefix(prefix, name), result=result)
+
+        # Add quantized weights and scales
+        if self.__dict__.get("qweight") is not None:
+            result[_concat_prefix(prefix, "qweight")] = self.__dict__["qweight"]
+            if self.__dict__.get("scale") is not None:
+                result[_concat_prefix(prefix, "scale")] = self.__dict__["scale"]
 
         return result
 
@@ -40,10 +49,11 @@ class BaseOP:
             if name.startswith("_"):
                 continue
             if isinstance(param, torch.Tensor):
-                item = state_dict.pop(_concat_prefix(prefix, name))
-                assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
-                setattr(self, name, item)
+                item = state_dict.pop(_concat_prefix(prefix, name), None)
+                if item is not None:
+                    assert isinstance(item, torch.Tensor)
+                    assert param.shape == item.shape and param.dtype == item.dtype
+                    setattr(self, name, item)
             elif isinstance(param, BaseOP):
                 param.load_state_dict(
                     state_dict, prefix=_concat_prefix(prefix, name), _internal=True

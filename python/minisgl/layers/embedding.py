@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
+from minisgl.layers.quant import dequantize_int8_per_channel
 from minisgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
@@ -27,14 +28,61 @@ class VocabParallelEmbedding(BaseOP):
         finish_idx = min(start_idx + self.num_embeddings_tp, num_embeddings)
         self.vocab_range = (start_idx, finish_idx - start_idx)
         self.weight = torch.empty(self.num_embeddings_tp, embedding_dim)
+        # For quantized weights
+        self.qweight = None
+        self.scale = None
         self._comm = DistributedCommunicator()
+
+    @property
+    def is_quantized(self) -> bool:
+        return self.qweight is not None
+
+    def dequantize_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        return dequantize_int8_per_channel(self.qweight, self.scale, dtype)
+
+    def load_state_dict(
+        self,
+        state_dict: Dict[str, torch.Tensor],
+        *,
+        prefix: str = "",
+        _internal: bool = False,
+    ) -> None:
+        from .base import _concat_prefix
+
+        # Check for quantized weight
+        qweight_key = _concat_prefix(prefix, "qweight")
+        if qweight_key in state_dict:
+            qweight = state_dict.pop(qweight_key)
+            scale_key = _concat_prefix(prefix, "scale")
+            scale = state_dict.pop(scale_key, None)
+
+            assert qweight.dtype == torch.int8, f"Expected int8 qweight, got {qweight.dtype}"
+            assert qweight.shape == (self.num_embeddings_tp, self.weight.shape[1])
+
+            self.qweight = qweight
+            self.scale = scale
+            self.weight = None
+        else:
+            # Standard FP weight loading
+            weight_key = _concat_prefix(prefix, "weight")
+            if weight_key in state_dict:
+                item = state_dict.pop(weight_key)
+                assert isinstance(item, torch.Tensor)
+                assert item.shape == (self.num_embeddings_tp, self.weight.shape[1])
+                self.weight = item
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from minisgl.kernel import indexing
 
+        # Handle quantized weights - dequantize for embedding lookup
+        if self.is_quantized:
+            weight = self.dequantize_weight(x.dtype)
+        else:
+            weight = self.weight
+
         y = indexing(
-            weights=self.weight,
+            weights=weight,
             indices=x,
             vocab_range=self.vocab_range if self.tp_size > 1 else None,
         )
@@ -69,10 +117,16 @@ class ParallelLMHead(VocabParallelEmbedding):
             # pop the lm_head.weights and lm_head.bias if they exist
             possible_weight = f"{prefix}.weight"
             possible_bias = f"{prefix}.bias"
+            possible_qweight = f"{prefix}.qweight"
+            possible_scale = f"{prefix}.scale"
             if possible_weight in state_dict:
                 state_dict.pop(possible_weight)
             if possible_bias in state_dict:
                 state_dict.pop(possible_bias)
+            if possible_qweight in state_dict:
+                state_dict.pop(possible_qweight)
+            if possible_scale in state_dict:
+                state_dict.pop(possible_scale)
 
     def state_dict(
         self,
@@ -95,7 +149,14 @@ class ParallelLMHead(VocabParallelEmbedding):
             del indices
 
         module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+
+        # Handle quantized weights
+        if module.is_quantized:
+            weight = module.dequantize_weight(x.dtype)
+        else:
+            weight = module.weight
+
+        logits = F.linear(x, weight, self.bias)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape

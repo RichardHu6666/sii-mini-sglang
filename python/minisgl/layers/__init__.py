@@ -12,6 +12,7 @@ from .linear import (
 from .moe import MoELayer
 from .norm import RMSNorm, RMSNormFused
 from .rotary import get_rope, set_rope_device
+from .quant import dynamic_quantize_int8_per_channel, dequantize_int8_per_channel
 
 __all__ = [
     "silu_and_mul",
@@ -32,4 +33,6 @@ __all__ = [
     "set_rope_device",
     "LinearReplicated",
     "MoELayer",
+    "dynamic_quantize_int8_per_channel",
+    "dequantize_int8_per_channel",
 ]
