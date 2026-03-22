@@ -19,7 +19,6 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
   - **Chunked Prefill**: Reduces peak memory usage for long-context serving.
   - **Overlap Scheduling**: Hides CPU scheduling overhead with GPU computation.
   - **Tensor Parallelism**: Scales inference across multiple GPUs.
-   - **Expert Parallelism (MoE)**: Distributes experts across GPUs for MoE inference.
   - **Optimized Kernels**: Integrates **FlashAttention** and **FlashInfer** for maximum efficiency.
   - ...
 
@@ -121,10 +120,6 @@ python -m minisgl --model "Qwen/Qwen3-0.6B"
 
 # Deploy meta-llama/Llama-3.1-70B-Instruct on 4 GPUs with Tensor Parallelism, on port 30000
 python -m minisgl --model "meta-llama/Llama-3.1-70B-Instruct" --tp 4 --port 30000
-
-# Deploy Qwen3 MoE with Expert Parallelism on 4 GPUs
-# Note: ep-size must be 1 or equal to tp-size.
-python -m minisgl --model "Qwen/Qwen3-32B" --tp 4 --ep-size 4 --moe-backend ep
 ```
 
 Once the server is running, you can send requests using standard tools like `curl` or any OpenAI-compatible client.
@@ -140,23 +135,6 @@ python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
 ![shell-example](https://lmsys.org/images/blog/minisgl/shell.png)
 
 You can also use `/reset` to clear the chat history.
-
-### 5. Optional EP GPU Smoke Test
-
-If you have a multi-GPU machine and want a quick end-to-end check for Expert Parallel (EP), run:
-
-```bash
-export MINISGL_EP_MODEL="Qwen/Qwen3-32B"
-export MINISGL_RUN_GPU_SMOKE=1
-export MINISGL_EP_WORLD_SIZE=2
-pytest tests/core/test_ep_smoke_gpu.py -q
-```
-
-Notes:
-- The smoke test needs at least 2 GPUs.
-- Set `MINISGL_EP_WORLD_SIZE` to match your target GPU count (e.g., 4).
-- It is skipped by default unless `MINISGL_RUN_GPU_SMOKE=1`.
-- `MINISGL_EP_MODEL` should point to an MoE model.
 
 ## Benchmark
 
@@ -177,34 +155,6 @@ Test Configuration:
 ### Online inference
 
 See [benchmark_qwen.py](./benchmark/online/bench_qwen.py) for more details.
-
-For a controlled EP-vs-non-EP A/B experiment (same model, same prompts, same load), use:
-
-```bash
-python benchmark/online/compare_ep_ab.py \
-   --model "/path/to/Qwen3-30B" \
-   --tp 4 \
-   --base-port 1919 \
-   --exp-port 1920 \
-   --num-prompts 64 \
-   --input-len 512 \
-   --output-len 128 \
-   --concurrency 32
-```
-
-To keep the run alive after terminal disconnect, use the background wrapper:
-
-```bash
-bash benchmark/online/run_compare_ep_ab.sh \
-   --model "/path/to/Qwen3-30B" \
-   --tp 4 \
-   --num-prompts 64 \
-   --input-len 512 \
-   --output-len 128 \
-   --concurrency 32
-```
-
-Reports and logs are written under `benchmark/online/results/`.
 
 Test Configuration:
 

@@ -287,14 +287,11 @@ def _adjust_config(config: EngineConfig):
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
     ## 自动选择MoE后端
     if config.model_config.is_moe and config.moe_backend == "auto":
-        override("moe_backend", "ep" if config.ep_size > 1 else "fused")
+        override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
     ## ep约束 关闭cuda graph
     if config.ep_size > 1:
         assert config.model_config.is_moe, "EP needs MoE models"
-        assert config.moe_backend == "ep", (
-            "EP mode requires --moe-backend ep (or auto with ep_size > 1)"
-        )
         assert config.model_config.num_experts % config.ep_size == 0, (
             f"num of experts ({config.model_config.num_experts})"
             f"must be divisible by ep size ({config.ep_size})"
