@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from minisgl.core import Batch, Req
@@ -12,6 +12,7 @@ from .utils import PendingReq
 if TYPE_CHECKING:
     from minisgl.kvcache import BaseCacheHandle
     from minisgl.message import UserMsg
+    from minisgl.metrics import MetricsCollector
 
     from .cache import CacheManager
     from .decode import DecodeManager
@@ -35,6 +36,7 @@ class PrefillAdder:
     reserved_size: int
     cache_manager: CacheManager
     table_manager: TableManager
+    metrics_collector: Optional['MetricsCollector'] = None
 
     def _try_allocate_one(self, req: PendingReq) -> Tuple[BaseCacheHandle, int] | None:
         if self.table_manager.available_size == 0:
@@ -43,6 +45,16 @@ class PrefillAdder:
         # TODO: consider host cache match case
         handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
+
+        # Record cache hit/miss at token level for metrics
+        if self.metrics_collector is not None:
+            input_len = req.input_len
+            if input_len > 0:
+                self.metrics_collector.record_cache_tokens(
+                    hit_tokens=cached_len,
+                    total_tokens=input_len
+                )
+
         # TODO: better estimate policy
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
@@ -119,6 +131,7 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    metrics_collector: Optional['MetricsCollector'] = None
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
@@ -133,6 +146,7 @@ class PrefillManager:
             reserved_size=self.decode_manager.inflight_tokens,
             cache_manager=self.cache_manager,
             table_manager=self.table_manager,
+            metrics_collector=self.metrics_collector,
         )
         reqs: List[Req] = []
         chunked_list: List[PendingReq] = []

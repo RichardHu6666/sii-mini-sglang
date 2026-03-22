@@ -14,6 +14,7 @@ from minisgl.message import (
     BatchFrontendMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
+    MetricsReportMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -25,6 +26,11 @@ def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
     if isinstance(msg, BatchTokenizerMsg):
         return msg.data
     return [msg]
+
+
+def _is_metrics_msg(msg: BaseTokenizerMsg) -> bool:
+    """Check if a message is a MetricsReportMsg."""
+    return isinstance(msg, MetricsReportMsg)
 
 
 @torch.inference_mode()
@@ -61,6 +67,14 @@ def tokenize_worker(
             pending_msg = _unwrap_msg(recv_listener.get())
             while len(pending_msg) < local_bs and not recv_listener.empty():
                 pending_msg.extend(_unwrap_msg(recv_listener.get()))
+
+            # Filter out MetricsReportMsg (pass through to frontend)
+            metrics_msg = [m for m in pending_msg if _is_metrics_msg(m)]
+            pending_msg = [m for m in pending_msg if not _is_metrics_msg(m)]
+
+            # Forward metrics messages to frontend
+            for m in metrics_msg:
+                send_frontend.put(m)
 
             logger.debug(f"Received {len(pending_msg)} messages")
 

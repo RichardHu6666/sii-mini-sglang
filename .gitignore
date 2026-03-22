@@ -4,6 +4,8 @@ mini-SGLang/python/minisgl.egg-info/SOURCES.txt
 mini-SGLang/python/minisgl.egg-info/requires.txt
 mini-SGLang/python/minisgl.egg-info/PKG-INFO
 mini-SGLang/python/minisgl.egg-info/top_level.txt
+/.claude
+/benchmark_results
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

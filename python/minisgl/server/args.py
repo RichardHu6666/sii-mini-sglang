@@ -71,7 +71,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
         "--model-path",
         "--model",
         type=str,
-        required=True,
+        default="/inspire/ssd/project/mianxiangdayuyanmoxing/public/Qwen2.5-14B-Instruct",
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
     )
 

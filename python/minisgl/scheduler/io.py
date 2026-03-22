@@ -3,7 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final, List
 
 import torch
-from minisgl.message import BaseBackendMsg, BaseTokenizerMsg, BatchTokenizerMsg, DetokenizeMsg
+from minisgl.message import (
+    BaseBackendMsg,
+    BaseTokenizerMsg,
+    BatchTokenizerMsg,
+    DetokenizeMsg,
+    MetricsReportMsg,
+)
 from minisgl.utils import ZmqPubQueue, ZmqPullQueue, ZmqPushQueue, ZmqSubQueue, init_logger
 
 if TYPE_CHECKING:
@@ -63,6 +69,7 @@ class SchedulerIOMixin:
 
         self.receive_msg = recv
         self.send_result = send
+        self.send_metrics_msg = self._send_metrics_msg_rank0 if tp_info.is_primary() else self._send_metrics_msg_rank1
 
     def run_when_idle(self):
         raise NotImplementedError("should be implemented")
@@ -131,3 +138,11 @@ class SchedulerIOMixin:
 
     def _reply_tokenizer_rank1(self, reply: List[DetokenizeMsg]) -> None:
         _ = reply  # do nothing for non-primary ranks
+
+    def _send_metrics_msg_rank0(self, msg: MetricsReportMsg) -> None:
+        """Send metrics message to API server (rank 0 only)."""
+        self._send_into_tokenizer.put(msg)
+
+    def _send_metrics_msg_rank1(self, msg: MetricsReportMsg) -> None:
+        """Do nothing for non-primary ranks."""
+        pass

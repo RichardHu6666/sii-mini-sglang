@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Literal, Tuple
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from minisgl.core import SamplingParams
 from minisgl.env import ENV
 from minisgl.message import (
@@ -18,6 +18,7 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    MetricsReportMsg,
     TokenizeMsg,
     UserReply,
 )
@@ -32,6 +33,143 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+
+
+@dataclass
+class MetricsState:
+    """State for metrics tracking in API server."""
+    timestamp: float = 0.0
+    running_requests: int = 0
+    queued_requests: int = 0
+    completed_requests: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    throughput_tokens_per_sec: float = 0.0
+    avg_ttft: float = 0.0
+    p50_ttft: float = 0.0
+    p90_ttft: float = 0.0
+    p99_ttft: float = 0.0
+    # KV cache metrics (SGLang compatible)
+    num_used_tokens: int = 0
+    max_total_num_tokens: int = 0
+    token_usage: float = 0.0
+    # Cache metrics (token-level)
+    cache_hit_rate: float = 0.0
+    cache_hit_tokens: int = 0
+    cache_prefill_tokens: int = 0
+    # Cache metrics (legacy, kept for compatibility)
+    cache_hits: int = 0
+    cache_misses: int = 0
+    # Queue time metrics
+    avg_queue_time: float = 0.0
+    p50_queue_time: float = 0.0
+    p99_queue_time: float = 0.0
+
+    def update_from_msg(self, msg: MetricsReportMsg) -> None:
+        """Update state from MetricsReportMsg."""
+        self.timestamp = time.time()
+        self.running_requests = msg.running_requests
+        self.queued_requests = msg.queued_requests
+        self.completed_requests = msg.completed_requests
+        self.total_input_tokens = msg.total_input_tokens
+        self.total_output_tokens = msg.total_output_tokens
+        self.throughput_tokens_per_sec = msg.throughput_tokens_per_sec
+        self.avg_ttft = msg.avg_ttft
+        self.p50_ttft = msg.p50_ttft
+        self.p90_ttft = msg.p90_ttft
+        self.p99_ttft = msg.p99_ttft
+        # KV cache metrics
+        self.num_used_tokens = msg.num_used_tokens
+        self.max_total_num_tokens = msg.max_total_num_tokens
+        self.token_usage = msg.token_usage
+        # Cache metrics (token-level)
+        self.cache_hit_rate = msg.cache_hit_rate
+        self.cache_hit_tokens = msg.cache_hit_tokens
+        self.cache_prefill_tokens = msg.cache_prefill_tokens
+        # Cache metrics (legacy)
+        self.cache_hits = msg.cache_hits
+        self.cache_misses = msg.cache_misses
+        # Queue time metrics
+        self.avg_queue_time = msg.avg_queue_time
+        self.p50_queue_time = msg.p50_queue_time
+        self.p99_queue_time = msg.p99_queue_time
+
+    def to_prometheus(self) -> str:
+        """Convert metrics to Prometheus exposition format."""
+        lines = [
+            # Request counts
+            "# HELP minisgl_running_requests Number of running requests",
+            "# TYPE minisgl_running_requests gauge",
+            f"minisgl_running_requests {self.running_requests}",
+            "# HELP minisgl_queued_requests Number of queued requests",
+            "# TYPE minisgl_queued_requests gauge",
+            f"minisgl_queued_requests {self.queued_requests}",
+            "# HELP minisgl_completed_requests Total number of completed requests",
+            "# TYPE minisgl_completed_requests counter",
+            f"minisgl_completed_requests {self.completed_requests}",
+            # Token counts
+            "# HELP minisgl_total_input_tokens Total number of input tokens processed",
+            "# TYPE minisgl_total_input_tokens counter",
+            f"minisgl_total_input_tokens {self.total_input_tokens}",
+            "# HELP minisgl_total_output_tokens Total number of output tokens generated",
+            "# TYPE minisgl_total_output_tokens counter",
+            f"minisgl_total_output_tokens {self.total_output_tokens}",
+            # Throughput
+            "# HELP minisgl_output_throughput Output throughput in tokens per second",
+            "# TYPE minisgl_output_throughput gauge",
+            f"minisgl_output_throughput {self.throughput_tokens_per_sec:.2f}",
+            # TTFT metrics
+            "# HELP minisgl_ttft_avg Average time to first token in seconds",
+            "# TYPE minisgl_ttft_avg gauge",
+            f"minisgl_ttft_avg {self.avg_ttft:.6f}",
+            "# HELP minisgl_ttft_p50 P50 time to first token in seconds",
+            "# TYPE minisgl_ttft_p50 gauge",
+            f"minisgl_ttft_p50 {self.p50_ttft:.6f}",
+            "# HELP minisgl_ttft_p90 P90 time to first token in seconds",
+            "# TYPE minisgl_ttft_p90 gauge",
+            f"minisgl_ttft_p90 {self.p90_ttft:.6f}",
+            "# HELP minisgl_ttft_p99 P99 time to first token in seconds",
+            "# TYPE minisgl_ttft_p99 gauge",
+            f"minisgl_ttft_p99 {self.p99_ttft:.6f}",
+            # KV cache metrics (SGLang compatible)
+            "# HELP minisgl_num_used_tokens Number of used tokens in KV cache",
+            "# TYPE minisgl_num_used_tokens gauge",
+            f"minisgl_num_used_tokens {self.num_used_tokens}",
+            "# HELP minisgl_max_total_num_tokens Maximum total number of tokens in KV cache pool",
+            "# TYPE minisgl_max_total_num_tokens gauge",
+            f"minisgl_max_total_num_tokens {self.max_total_num_tokens}",
+            "# HELP minisgl_token_usage The token usage ratio (used/total)",
+            "# TYPE minisgl_token_usage gauge",
+            f"minisgl_token_usage {self.token_usage:.6f}",
+            # Cache metrics (token-level)
+            "# HELP minisgl_cache_hit_rate The prefix cache hit rate (tokens)",
+            "# TYPE minisgl_cache_hit_rate gauge",
+            f"minisgl_cache_hit_rate {self.cache_hit_rate:.4f}",
+            "# HELP minisgl_cache_hit_tokens Total number of cache hit tokens",
+            "# TYPE minisgl_cache_hit_tokens counter",
+            f"minisgl_cache_hit_tokens {self.cache_hit_tokens}",
+            "# HELP minisgl_cache_prefill_tokens Total number of prefill tokens",
+            "# TYPE minisgl_cache_prefill_tokens counter",
+            f"minisgl_cache_prefill_tokens {self.cache_prefill_tokens}",
+            # Cache metrics (legacy)
+            "# HELP minisgl_cache_hits Total number of cache hits (requests)",
+            "# TYPE minisgl_cache_hits counter",
+            f"minisgl_cache_hits {self.cache_hits}",
+            "# HELP minisgl_cache_misses Total number of cache misses (requests)",
+            "# TYPE minisgl_cache_misses counter",
+            f"minisgl_cache_misses {self.cache_misses}",
+            # Queue time metrics
+            "# HELP minisgl_queue_time_avg Average queue time in seconds",
+            "# TYPE minisgl_queue_time_avg gauge",
+            f"minisgl_queue_time_avg {self.avg_queue_time:.6f}",
+            "# HELP minisgl_queue_time_p50 P50 queue time in seconds",
+            "# TYPE minisgl_queue_time_p50 gauge",
+            f"minisgl_queue_time_p50 {self.p50_queue_time:.6f}",
+            "# HELP minisgl_queue_time_p99 P99 queue time in seconds",
+            "# TYPE minisgl_queue_time_p99 gauge",
+            f"minisgl_queue_time_p99 {self.p99_queue_time:.6f}",
+        ]
+        return "\n".join(lines) + "\n"
 
 
 def get_global_state() -> FrontendManager:
@@ -106,6 +244,8 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    # Metrics state
+    metrics: MetricsState = field(default_factory=lambda: MetricsState())
 
     def new_user(self) -> int:
         uid = self.uid_counter
@@ -114,9 +254,20 @@ class FrontendManager:
         self.event_map[uid] = asyncio.Event()
         return uid
 
+    def update_metrics(self, msg: MetricsReportMsg) -> None:
+        """Update metrics from scheduler."""
+        self.metrics.update_from_msg(msg)
+
+    def get_metrics_prometheus(self) -> str:
+        """Get metrics in Prometheus format."""
+        return self.metrics.to_prometheus()
+
     async def listen(self):
         while True:
             msg = await self.recv_tokenizer.get()
+            if isinstance(msg, MetricsReportMsg):
+                self.update_metrics(msg)
+                continue
             for msg in _unwrap_msg(msg):
                 if msg.uid not in self.ack_map:
                     continue
@@ -288,6 +439,13 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 async def available_models():
     state = get_global_state()
     return ModelList(data=[ModelCard(id=state.config.model_path, root=state.config.model_path)])
+
+
+@app.get("/metrics")
+async def metrics():
+    """Expose metrics in Prometheus format."""
+    state = get_global_state()
+    return PlainTextResponse(state.get_metrics_prometheus(), media_type="text/plain")
 
 
 async def shell_completion(req: OpenAICompletionRequest):

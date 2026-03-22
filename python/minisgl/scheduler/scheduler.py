@@ -11,8 +11,10 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    MetricsReportMsg,
     UserMsg,
 )
+from minisgl.metrics import MetricsCollector
 from minisgl.utils import init_logger, load_tokenizer
 
 from .cache import CacheManager
@@ -24,6 +26,7 @@ from .table import TableManager
 
 if TYPE_CHECKING:
     from minisgl.engine import BatchSamplingArgs, ForwardOutput
+    from minisgl.message import MetricsReportMsg
 
 
 logger = init_logger(__name__)
@@ -60,8 +63,20 @@ class Scheduler(SchedulerIOMixin):
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
+
+        # Initialize metrics collector
+        self.metrics_collector = MetricsCollector()
+        self._metrics_counter = 0
+
+        # Set up KV cache info callbacks for metrics
+        self.metrics_collector.set_kv_cache_info(
+            get_used_tokens_fn=lambda: (self.cache_manager.num_pages - len(self.cache_manager.free_slots)) * self.cache_manager.page_size,
+            get_max_tokens_fn=lambda: self.cache_manager.num_pages * self.cache_manager.page_size,
+        )
+
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager, self.table_manager, self.decode_manager,
+            metrics_collector=self.metrics_collector,
         )
 
         # some alias for easy access
@@ -74,6 +89,9 @@ class Scheduler(SchedulerIOMixin):
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+        # Send initial metrics to API server (so max_total_num_tokens is not 0)
+        self._send_metrics()
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -155,16 +173,31 @@ class Scheduler(SchedulerIOMixin):
                     finished |= next_token == self.eos_token_id
                 reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
 
+                # Record metrics: first token (when decode_len == cached_len + 1)
+                # This means we just generated the first token after prefill
+                if req.device_len == req.cached_len + 1:
+                    self.metrics_collector.request_first_token(req.uid)
+                self.metrics_collector.request_output_token(req.uid)
+
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
+                    # Record metrics: request completed
+                    self.metrics_collector.request_completed(req.uid)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
+
+        # Update queued count and periodically send metrics
+        self.metrics_collector.set_queued_count(len(self.prefill_manager.pending_list))
+        self._metrics_counter += 1
+        if self._metrics_counter >= 10:  # Send metrics every 10 batches
+            self._send_metrics()
+            self._metrics_counter = 0
 
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
@@ -186,11 +219,15 @@ class Scheduler(SchedulerIOMixin):
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
+            # Record metrics: request arrived
+            self.metrics_collector.request_arrived(msg.uid, len(msg.input_ids))
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            # Record metrics: request aborted
+            self.metrics_collector.request_aborted(msg.uid)
             if req_to_free is not None:
                 self._free_req_resources(req_to_free)
         else:
@@ -200,6 +237,38 @@ class Scheduler(SchedulerIOMixin):
     def _free_req_resources(self, req: Req) -> None:
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
+
+    def _send_metrics(self) -> None:
+        """Send metrics to API server via ZMQ."""
+        snapshot = self.metrics_collector.get_snapshot()
+        msg = MetricsReportMsg(
+            running_requests=snapshot.running_requests,
+            queued_requests=snapshot.queued_requests,
+            completed_requests=snapshot.completed_requests,
+            total_input_tokens=snapshot.total_input_tokens,
+            total_output_tokens=snapshot.total_output_tokens,
+            throughput_tokens_per_sec=snapshot.throughput_tokens_per_sec,
+            avg_ttft=snapshot.avg_ttft,
+            p50_ttft=snapshot.p50_ttft,
+            p90_ttft=snapshot.p90_ttft,
+            p99_ttft=snapshot.p99_ttft,
+            # KV cache metrics
+            num_used_tokens=snapshot.num_used_tokens,
+            max_total_num_tokens=snapshot.max_total_num_tokens,
+            token_usage=snapshot.token_usage,
+            # Cache metrics (token-level)
+            cache_hit_rate=snapshot.cache_hit_rate,
+            cache_hit_tokens=snapshot.cache_hit_tokens,
+            cache_prefill_tokens=snapshot.cache_prefill_tokens,
+            # Cache metrics (legacy, kept for compatibility)
+            cache_hits=snapshot.cache_hits,
+            cache_misses=snapshot.cache_misses,
+            # Queue time metrics
+            avg_queue_time=snapshot.avg_queue_time,
+            p50_queue_time=snapshot.p50_queue_time,
+            p99_queue_time=snapshot.p99_queue_time,
+        )
+        self.send_metrics_msg(msg)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
