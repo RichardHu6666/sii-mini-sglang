@@ -141,6 +141,23 @@ python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
 
 You can also use `/reset` to clear the chat history.
 
+### 5. Optional EP GPU Smoke Test
+
+If you have a multi-GPU machine and want a quick end-to-end check for Expert Parallel (EP), run:
+
+```bash
+export MINISGL_EP_MODEL="Qwen/Qwen3-32B"
+export MINISGL_RUN_GPU_SMOKE=1
+export MINISGL_EP_WORLD_SIZE=2
+pytest tests/core/test_ep_smoke_gpu.py -q
+```
+
+Notes:
+- The smoke test needs at least 2 GPUs.
+- Set `MINISGL_EP_WORLD_SIZE` to match your target GPU count (e.g., 4).
+- It is skipped by default unless `MINISGL_RUN_GPU_SMOKE=1`.
+- `MINISGL_EP_MODEL` should point to an MoE model.
+
 ## Benchmark
 
 ### Offline inference
