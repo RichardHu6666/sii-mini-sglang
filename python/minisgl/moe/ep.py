@@ -1,3 +1,6 @@
+import csv
+import math
+import os
 import torch
 import torch.distributed as dist
 from minisgl.distributed import get_ep_info
@@ -14,6 +17,96 @@ logger = init_logger(__name__)
 class EPMoe(BaseMoeBackend):
     def __init__(self) -> None:
         self._profile_step = 0
+        self._csv_initialized = False
+        self._csv_path = os.getenv("MINISGL_EP_PROFILE_CSV", "")
+        self._window = max(int(os.getenv("MINISGL_EP_PROFILE_WINDOW", "200")), 1)
+        self._route_hist: list[float] = []
+        self._dispatch_hist: list[float] = []
+        self._compute_hist: list[float] = []
+        self._combine_hist: list[float] = []
+        self._reduce_hist: list[float] = []
+        self._comm_hist: list[float] = []
+        self._spike_dispatch_count = 0
+        self._spike_combine_count = 0
+        self._spike_comm_count = 0
+
+    def _push_hist(self, hist: list[float], x: float) -> None:
+        hist.append(float(x))
+        if len(hist) > self._window:
+            del hist[0]
+
+    @staticmethod
+    def _agg(hist: list[float]) -> tuple[float, float, float, float]:
+        if not hist:
+            return 0.0, 0.0, 0.0, 0.0
+        sorted_hist = sorted(hist)
+        n = len(sorted_hist)
+        p95 = sorted_hist[min(int(n * 0.95), n - 1)]
+        p99 = sorted_hist[min(int(n * 0.99), n - 1)]
+        mean = sum(sorted_hist) / n
+        return mean, p95, p99, sorted_hist[-1]
+
+    def _init_csv(self) -> None:
+        if self._csv_initialized or not self._csv_path:
+            return
+        with open(self._csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "step",
+                    "pairs",
+                    "recv",
+                    "route_ms",
+                    "dispatch_ms",
+                    "compute_ms",
+                    "combine_ms",
+                    "reduce_ms",
+                    "comm_ms",
+                    "route_mean",
+                    "route_p95",
+                    "route_p99",
+                    "route_max",
+                    "dispatch_mean",
+                    "dispatch_p95",
+                    "dispatch_p99",
+                    "dispatch_max",
+                    "compute_mean",
+                    "compute_p95",
+                    "compute_p99",
+                    "compute_max",
+                    "combine_mean",
+                    "combine_p95",
+                    "combine_p99",
+                    "combine_max",
+                    "comm_mean",
+                    "comm_p95",
+                    "comm_p99",
+                    "comm_max",
+                    "reduce_mean",
+                    "reduce_p95",
+                    "reduce_p99",
+                    "reduce_max",
+                    "expert_max",
+                    "expert_mean",
+                    "expert_cv",
+                    "send_max",
+                    "send_mean",
+                    "recv_max",
+                    "recv_mean",
+                    "spike_comm_gt1ms",
+                    "spike_dispatch_gt1ms",
+                    "spike_combine_gt1ms",
+                ]
+            )
+        self._csv_initialized = True
+
+    def _append_csv(self, row: list[object]) -> None:
+        if not self._csv_path:
+            return
+        self._init_csv()
+        with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
 
     def forward(
         self,
@@ -74,6 +167,13 @@ class EPMoe(BaseMoeBackend):
         # 计算通信量
         send_hidden = hidden_states[sorted_token_idx].contiguous()
         send_counts = torch.bincount(dest_rank, minlength=ep_size)
+        local_expert_load = torch.bincount(local_ids, minlength=num_local_experts).to(torch.float32)
+        expert_mean = float(local_expert_load.mean().item()) if num_local_experts > 0 else 0.0
+        expert_max = float(local_expert_load.max().item()) if num_local_experts > 0 else 0.0
+        expert_std = (
+            float(local_expert_load.std(unbiased=False).item()) if num_local_experts > 0 else 0.0
+        )
+        expert_cv = (expert_std / expert_mean) if expert_mean > 0 else 0.0
         if do_profile and ev_route_end is not None:
             ev_route_end.record()
 
@@ -204,6 +304,35 @@ class EPMoe(BaseMoeBackend):
                 comm_combine_ms = ev_compute_end.elapsed_time(ev_comm_combine_end)
                 reduce_ms = ev_comm_combine_end.elapsed_time(ev_end)
                 comm_total_ms = comm_dispatch_ms + comm_combine_ms
+
+                self._push_hist(self._route_hist, route_ms)
+                self._push_hist(self._dispatch_hist, comm_dispatch_ms)
+                self._push_hist(self._compute_hist, compute_ms)
+                self._push_hist(self._combine_hist, comm_combine_ms)
+                self._push_hist(self._reduce_hist, reduce_ms)
+                self._push_hist(self._comm_hist, comm_total_ms)
+
+                if comm_total_ms > 1.0:
+                    self._spike_comm_count += 1
+                if comm_dispatch_ms > 1.0:
+                    self._spike_dispatch_count += 1
+                if comm_combine_ms > 1.0:
+                    self._spike_combine_count += 1
+
+                route_s = self._agg(self._route_hist)
+                dispatch_s = self._agg(self._dispatch_hist)
+                compute_s = self._agg(self._compute_hist)
+                combine_s = self._agg(self._combine_hist)
+                reduce_s = self._agg(self._reduce_hist)
+                comm_s = self._agg(self._comm_hist)
+
+                send_counts_f = send_counts.to(torch.float32)
+                recv_counts_f = recv_counts.to(torch.float32) if not local_only else send_counts_f
+                send_max = float(send_counts_f.max().item())
+                send_mean = float(send_counts_f.mean().item())
+                recv_max = float(recv_counts_f.max().item())
+                recv_mean = float(recv_counts_f.mean().item())
+
                 logger.info_rank0(
                     "EP profile step=%d pairs=%d recv=%d ms(route=%.3f comm=%.3f compute=%.3f reduce=%.3f, dispatch=%.3f, combine=%.3f)",
                     self._profile_step,
@@ -215,6 +344,92 @@ class EPMoe(BaseMoeBackend):
                     reduce_ms,
                     comm_dispatch_ms,
                     comm_combine_ms,
+                )
+                logger.info_rank0(
+                    "EP p0 window=%d step=%d stat(route m/p95/p99/max=%.3f/%.3f/%.3f/%.3f, dispatch=%.3f/%.3f/%.3f/%.3f, compute=%.3f/%.3f/%.3f/%.3f, combine=%.3f/%.3f/%.3f/%.3f, reduce=%.3f/%.3f/%.3f/%.3f, comm=%.3f/%.3f/%.3f/%.3f) load(expert max/mean/cv=%.1f/%.1f/%.3f) msg(send max/mean=%.1f/%.1f recv max/mean=%.1f/%.1f) spikes(>1ms comm=%d dispatch=%d combine=%d)",
+                    self._window,
+                    self._profile_step,
+                    route_s[0],
+                    route_s[1],
+                    route_s[2],
+                    route_s[3],
+                    dispatch_s[0],
+                    dispatch_s[1],
+                    dispatch_s[2],
+                    dispatch_s[3],
+                    compute_s[0],
+                    compute_s[1],
+                    compute_s[2],
+                    compute_s[3],
+                    combine_s[0],
+                    combine_s[1],
+                    combine_s[2],
+                    combine_s[3],
+                    reduce_s[0],
+                    reduce_s[1],
+                    reduce_s[2],
+                    reduce_s[3],
+                    comm_s[0],
+                    comm_s[1],
+                    comm_s[2],
+                    comm_s[3],
+                    expert_max,
+                    expert_mean,
+                    expert_cv,
+                    send_max,
+                    send_mean,
+                    recv_max,
+                    recv_mean,
+                    self._spike_comm_count,
+                    self._spike_dispatch_count,
+                    self._spike_combine_count,
+                )
+                self._append_csv(
+                    [
+                        self._profile_step,
+                        num_pairs,
+                        total_recv,
+                        route_ms,
+                        comm_dispatch_ms,
+                        compute_ms,
+                        comm_combine_ms,
+                        reduce_ms,
+                        comm_total_ms,
+                        route_s[0],
+                        route_s[1],
+                        route_s[2],
+                        route_s[3],
+                        dispatch_s[0],
+                        dispatch_s[1],
+                        dispatch_s[2],
+                        dispatch_s[3],
+                        compute_s[0],
+                        compute_s[1],
+                        compute_s[2],
+                        compute_s[3],
+                        combine_s[0],
+                        combine_s[1],
+                        combine_s[2],
+                        combine_s[3],
+                        comm_s[0],
+                        comm_s[1],
+                        comm_s[2],
+                        comm_s[3],
+                        reduce_s[0],
+                        reduce_s[1],
+                        reduce_s[2],
+                        reduce_s[3],
+                        expert_max,
+                        expert_mean,
+                        expert_cv,
+                        send_max,
+                        send_mean,
+                        recv_max,
+                        recv_mean,
+                        self._spike_comm_count,
+                        self._spike_dispatch_count,
+                        self._spike_combine_count,
+                    ]
                 )
 
         return out
