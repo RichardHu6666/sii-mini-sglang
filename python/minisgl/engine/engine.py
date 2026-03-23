@@ -6,7 +6,7 @@ from typing import Any, Dict, NamedTuple, Tuple
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
-from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
+from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info, set_ep_info
 from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
 from minisgl.models import create_model, load_weight
@@ -19,7 +19,7 @@ from .sample import BatchSamplingArgs, Sampler
 
 logger = init_logger(__name__)
 
-
+# forward返回值定义
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -29,18 +29,26 @@ class ForwardOutput(NamedTuple):
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()
+        # 分布式信息设置
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        set_ep_info(
+            rank=config.tp_info.rank % max(config.ep_size, 1),
+            size=config.ep_size
+        )
         _adjust_config(config)
 
+        # gpu设备设置
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
         torch.manual_seed(42)
+        # 创建cuda流
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
+        # 初始化
         self.dtype = config.dtype
         self.ctx = Context(config.page_size)
         set_global_ctx(self.ctx)
-
+        # 通信初始化
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
@@ -108,9 +116,38 @@ class Engine:
             vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
-
+    # 通信初始化
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
-        if config.tp_info.size == 1 or config.use_pynccl:
+        ## 启用ep
+        if config.ep_size > 1:
+            torch.distributed.init_process_group(
+                backend="nccl" ,
+                rank=config.tp_info.rank,
+                world_size=config.tp_info.size,
+                timeout=timedelta(seconds=config.distributed_timeout),
+                init_method=config.distributed_addr,
+            )
+            # cpu用gloo通信库，避免显存不均衡
+            tp_cpu_group = torch.distributed.new_group(backend="gloo")
+            assert tp_cpu_group is not None
+            ## 设置ep进程组
+            from minisgl.distributed.impl import set_ep_group
+            
+            ep_nccl_group = torch.distributed.group.WORLD
+            assert ep_nccl_group is not None
+            set_ep_group(ep_nccl_group)
+            logger.info_rank0(f"Ep enabled: ep_size={config.ep_size}")
+            
+            ## 启用pynccl
+            if config.use_pynccl:
+                max_bytes = (
+                    config.max_forward_len
+                    * config.model_config.hidden_size
+                    * self.dtype.itemsize
+                )
+                enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+        ## 或者单gpu / 不用pynccl
+        elif config.tp_info.size == 1 or config.use_pynccl:
             torch.distributed.init_process_group(
                 backend="gloo",
                 rank=config.tp_info.rank,
@@ -121,9 +158,12 @@ class Engine:
             tp_cpu_group = torch.distributed.group.WORLD
             assert tp_cpu_group is not None
             max_bytes = (
-                config.max_forward_len * config.model_config.hidden_size * self.dtype.itemsize
+                config.max_forward_len
+                * config.model_config.hidden_size
+                *self.dtype.itemsize
             )
             enable_pynccl_distributed(config.tp_info, tp_cpu_group, max_bytes)
+        ## TP但不用pynccl
         else:
             torch.distributed.init_process_group(
                 backend="nccl",
@@ -134,10 +174,25 @@ class Engine:
             )
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
+        
         return tp_cpu_group
-
+            
+    # 权重加载
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
+        # 虚拟权重快速测试
         if config.use_dummy_weight:
+            result: Dict[str, torch.Tensor] = {}
+            for k, v in self.model.state_dict().items():
+                if "experts" in k:
+                    prefix, param = k.rsplit("experts.", 1)
+                    for i in range(v.shape[0]):
+                        result[f"{prefix}experts.{i}.{param}"] = torch.randn_like(
+                            v[i], device=self.device
+                        )
+                else:
+                    result[k] = torch.randn_like(v, device=self.device)
+            return result
+        else:
             return {
                 k: torch.randn_like(v, device=self.device)
                 for k, v in self.model.state_dict().items()
@@ -158,6 +213,14 @@ class Engine:
                     state_dict[k] = v
             return state_dict
 
+                k: v.to(self.device)
+                for k, v in load_weight(
+                    config.model_path,
+                    self.device,
+                    ep_size=config.ep_size
+                )
+            }
+    # kv缓存页数确定
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
@@ -180,6 +243,7 @@ class Engine:
         logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
         return num_pages
 
+    # 显存同步检查
     def _sync_get_memory(self) -> Tuple[int, int]:
         """Get the min and max free memory across TP ranks."""
         torch.cuda.synchronize(self.device)
@@ -200,7 +264,7 @@ class Engine:
             raise RuntimeError("Memory across TP ranks are imbalanced")
 
         return min_free_memory, max_free_memory
-
+    # 前向传播
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
@@ -274,20 +338,30 @@ def _should_quantize(name: str) -> bool:
     ]
     return any(name.endswith(suffix) for suffix in quantize_suffixes)
 
-
+# 配置调整
 def _adjust_config(config: EngineConfig):
     def override(attr: str, value: Any):  # this is dangerous, use with caution
         object.__setattr__(config, attr, value)
-
+    ## 自动选择注意力后端
     if config.attention_backend == "auto":
         backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
         override("attention_backend", backend)
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
-
+    ## tensorRT LLM约束 16/32/64
     if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
         override("page_size", 64)
         logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
-
+    ## 自动选择MoE后端
     if config.model_config.is_moe and config.moe_backend == "auto":
         override("moe_backend", "fused")
         logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")
+    ## ep约束 关闭cuda graph
+    if config.ep_size > 1:
+        assert config.model_config.is_moe, "EP needs MoE models"
+        assert config.model_config.num_experts % config.ep_size == 0, (
+            f"num of experts ({config.model_config.num_experts})"
+            f"must be divisible by ep size ({config.ep_size})"
+        )
+        if config.cuda_graph_max_bs is None or config.cuda_graph_max_bs> 0:
+            override("cuda_graph_max_bs", 0)
+            logger.info_rank0("CUDA graphs disabled by ep mode")

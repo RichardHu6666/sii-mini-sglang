@@ -34,5 +34,35 @@ def get_tp_info() -> DistributedInfo:
 def try_get_tp_info() -> DistributedInfo | None:
     return _TP_INFO
 
+# 加入EPinfo
+_EP__INFO : DistributedInfo | None = None
 
-__all__ = ["DistributedInfo", "set_tp_info", "get_tp_info", "try_get_tp_info"]
+# 初始化设置ep信息
+def set_ep_info(rank: int, size: int) -> None:
+    global _EP__INFO
+    if _EP__INFO is not None:
+        raise RuntimeError("EP info has been set")
+    _EP__INFO = DistributedInfo(rank, size)
+    
+# 获取ep信息（已设置情况下）
+def get_ep_info() -> DistributedInfo:
+    if _EP__INFO is None:
+        raise RuntimeError("EP info has not been set")
+    return _EP__INFO
+
+# 尝试获取ep信息
+def try_get_ep_info() -> DistributedInfo | None:
+    return _EP__INFO
+
+# 导出列表
+
+__all__ = [
+    "DistributedInfo",
+    "set_tp_info",
+    "get_tp_info",
+    "try_get_tp_info",
+    "set_ep_info",
+    "get_ep_info",
+    "try_get_ep_info",
+]
+

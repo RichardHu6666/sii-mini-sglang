@@ -10,11 +10,14 @@ Features:
 import argparse
 import asyncio
 import json
+import csv
+import os
 import random
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -308,6 +311,113 @@ async def run_with_semaphore(
     await asyncio.gather(*workers)
 
     return results
+
+
+def _calc_stats(values: List[float]) -> tuple[float, float, float, float]:
+    values = sorted(values)
+    n = len(values)
+    return (
+        sum(values) / n,
+        values[min(int(n * 0.95), n - 1)],
+        values[min(int(n * 0.99), n - 1)],
+        values[-1],
+    )
+
+
+def _emit_benchmark_summary(results, output_csv: str) -> None:
+    all_tics = [r.tics for r in results]
+    first_times = []
+    token_times = []
+    e2e_times = []
+    for tics in all_tics:
+        deltas = [tics[i + 1] - tics[i] for i in range(len(tics) - 1)]
+        first_times.append(deltas[0])
+        token_times.extend(deltas[1:])
+        e2e_times.append(tics[-1] - tics[0])
+
+    ttft = _calc_stats(first_times)
+    tpot = _calc_stats(token_times)
+    e2e = _calc_stats(e2e_times)
+
+    min_time = min(min(x) for x in all_tics)
+    max_time = max(max(x) for x in all_tics)
+    duration = max_time - min_time
+    num_tokens = sum(len(x) for x in all_tics)
+    num_requests = len(all_tics)
+    throughput_token = num_tokens / duration
+    throughput_req = num_requests / duration
+
+    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
+    write_header = not os.path.exists(output_csv)
+    with open(output_csv, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(
+                [
+                    "timestamp",
+                    "num_requests",
+                    "num_tokens",
+                    "duration_s",
+                    "ttft_avg_ms",
+                    "ttft_p95_ms",
+                    "ttft_p99_ms",
+                    "ttft_max_ms",
+                    "tpot_avg_ms",
+                    "tpot_p95_ms",
+                    "tpot_p99_ms",
+                    "tpot_max_ms",
+                    "e2e_avg_s",
+                    "e2e_p95_s",
+                    "e2e_p99_s",
+                    "e2e_max_s",
+                    "throughput_token_s",
+                    "throughput_req_s",
+                ]
+            )
+        writer.writerow(
+            [
+                datetime.now().isoformat(timespec="seconds"),
+                num_requests,
+                num_tokens,
+                duration,
+                ttft[0] * 1000,
+                ttft[1] * 1000,
+                ttft[2] * 1000,
+                ttft[3] * 1000,
+                tpot[0] * 1000,
+                tpot[1] * 1000,
+                tpot[2] * 1000,
+                tpot[3] * 1000,
+                e2e[0],
+                e2e[1],
+                e2e[2],
+                e2e[3],
+                throughput_token,
+                throughput_req,
+            ]
+        )
+
+    logger.info("P0 benchmark summary csv saved: %s", output_csv)
+    logger.info(
+        "P0 summary: req=%d tokens=%d duration=%.2fs TTFT(avg/p95/p99/max)=%.2f/%.2f/%.2f/%.2fms TPOT(avg/p95/p99/max)=%.2f/%.2f/%.2f/%.2fms E2E(avg/p95/p99/max)=%.2f/%.2f/%.2f/%.2fs throughput(token/s,req/s)=%.2f,%.4f",
+        num_requests,
+        num_tokens,
+        duration,
+        ttft[0] * 1000,
+        ttft[1] * 1000,
+        ttft[2] * 1000,
+        ttft[3] * 1000,
+        tpot[0] * 1000,
+        tpot[1] * 1000,
+        tpot[2] * 1000,
+        tpot[3] * 1000,
+        e2e[0],
+        e2e[1],
+        e2e[2],
+        e2e[3],
+        throughput_token,
+        throughput_req,
+    )
 
 
 async def main():

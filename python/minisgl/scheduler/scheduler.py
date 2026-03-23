@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import os
+import time
 import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
@@ -89,6 +92,18 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
+        self._p2_prefill_streak = 0
+        self._p2_decode_gap_steps = 0
+        self._p2_decode_streak = 0
+        self._p2_decode_tps_ema = 0.0
+
+        # P0 observability for scheduler-level behavior.
+        self._sched_step = 0
+        self._sched_csv_path = os.getenv("MINISGL_SCHED_PROFILE_CSV", "")
+        self._sched_csv_initialized = False
+        self._sched_log_interval = max(int(os.getenv("MINISGL_SCHED_PROFILE_INTERVAL", "50")), 1)
+        self._sched_forward_hist: list[float] = []
+        self._sched_e2e_hist: list[float] = []
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -311,22 +326,188 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # P2 decode-first policy (default disabled):
+        # keep decode latency stable, insert only small prefill slices opportunistically.
+        p2_enable = bool(ENV.P2_OVERLAP_ENABLE)
+        short_req_tokens = max(int(ENV.P2_SHORT_REQ_MAX_TOKENS.value), 1)
+        max_wait_ms = max(int(ENV.P2_MAX_WAIT_MS.value), 0)
+
+        if not p2_enable:
+            batch = (
+                self.prefill_manager.schedule_next_batch(self.prefill_budget)
+                or self.decode_manager.schedule_next_batch()
+            )
+            return self._prepare_batch(batch) if batch else None
+
+        prefill_runnable = self.prefill_manager.runnable
+        decode_runnable = self.decode_manager.runnable
+        decode_steps_before_prefill = max(int(ENV.P2_DECODE_RUN_STEPS_BEFORE_PREFILL.value), 1)
+        prefill_slice_budget = max(int(ENV.P2_PREFILL_SLICE_BUDGET.value), 1)
+        prefill_cap_when_decode = max(int(ENV.P2_PREFILL_MAX_EXTEND_WHEN_DECODE.value), 0)
+        use_governor = bool(ENV.P2_GOVERNOR_ENABLE)
+        decode_tps_min = float(ENV.P2_DECODE_TPS_MIN.value)
+
+        batch = None
+        if prefill_runnable and decode_runnable:
+            # Decode-first: only insert a small prefill slice every N decode steps,
+            # and only when decode throughput is healthy.
+            can_insert_prefill = self._p2_decode_streak >= decode_steps_before_prefill
+            if can_insert_prefill and use_governor:
+                can_insert_prefill = self._p2_decode_tps_ema >= decode_tps_min
+
+            if can_insert_prefill:
+                effective_prefill_budget = prefill_slice_budget
+                if prefill_cap_when_decode > 0:
+                    effective_prefill_budget = min(effective_prefill_budget, prefill_cap_when_decode)
+                batch = self.prefill_manager.schedule_next_batch(
+                    effective_prefill_budget,
+                    short_output_threshold=short_req_tokens,
+                    max_wait_ms=max_wait_ms,
+                )
+                if batch is not None:
+                    self._p2_decode_streak = 0
+                    self._p2_decode_gap_steps += 1
+                    return self._prepare_batch(batch)
+
+            batch = self.decode_manager.schedule_next_batch(
+                short_remain_threshold=short_req_tokens,
+                max_wait_ms=max_wait_ms,
+            )
+            if batch is not None:
+                self._p2_decode_streak += 1
+                self._p2_decode_gap_steps = 0
+        elif prefill_runnable:
+            batch = self.prefill_manager.schedule_next_batch(
+                self.prefill_budget,
+                short_output_threshold=short_req_tokens,
+                max_wait_ms=max_wait_ms,
+            )
+            if batch is not None:
+                self._p2_prefill_streak += 1
+                self._p2_decode_streak = 0
+        elif decode_runnable:
+            batch = self.decode_manager.schedule_next_batch(
+                short_remain_threshold=short_req_tokens,
+                max_wait_ms=max_wait_ms,
+            )
+            self._p2_prefill_streak = 0
+            self._p2_decode_gap_steps = 0
+            if batch is not None:
+                self._p2_decode_streak += 1
+
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        t0 = time.perf_counter()
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
+        t1 = time.perf_counter()
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         # Only update running_reqs for decode batch
         # Prefill requests should be added to running_reqs after they finish prefill
         if batch.is_decode:
             self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        t2 = time.perf_counter()
+
+        self._sched_step += 1
+        forward_ms = (t1 - t0) * 1000.0
+        e2e_ms = (t2 - t0) * 1000.0
+
+        if batch.is_decode and e2e_ms > 0:
+            # 1 decode step emits 1 token per active req.
+            decode_tps = batch.size / (e2e_ms / 1000.0)
+            if self._p2_decode_tps_ema <= 0:
+                self._p2_decode_tps_ema = decode_tps
+            else:
+                self._p2_decode_tps_ema = 0.2 * decode_tps + 0.8 * self._p2_decode_tps_ema
+
+        self._sched_forward_hist.append(forward_ms)
+        self._sched_e2e_hist.append(e2e_ms)
+        if len(self._sched_forward_hist) > 200:
+            del self._sched_forward_hist[0]
+            del self._sched_e2e_hist[0]
+
+        if self._sched_step % self._sched_log_interval == 0:
+            f_sorted = sorted(self._sched_forward_hist)
+            e_sorted = sorted(self._sched_e2e_hist)
+
+            def _stats(xs: list[float]) -> tuple[float, float, float, float]:
+                n = len(xs)
+                return (
+                    sum(xs) / n,
+                    xs[min(int(n * 0.95), n - 1)],
+                    xs[min(int(n * 0.99), n - 1)],
+                    xs[-1],
+                )
+
+            fs = _stats(f_sorted)
+            es = _stats(e_sorted)
+            extend_tokens = sum(req.extend_len for req in batch.reqs)
+            max_extend = max((req.extend_len for req in batch.reqs), default=0)
+            logger.info_rank0(
+                "SCHED p0 step=%d batch(size=%d prefill=%d extend_sum=%d extend_max=%d) ms(forward m/p95/p99/max=%.3f/%.3f/%.3f/%.3f, e2e=%.3f/%.3f/%.3f/%.3f)",
+                self._sched_step,
+                batch.size,
+                int(batch.is_prefill),
+                extend_tokens,
+                max_extend,
+                fs[0],
+                fs[1],
+                fs[2],
+                fs[3],
+                es[0],
+                es[1],
+                es[2],
+                es[3],
+            )
+
+            if self._sched_csv_path:
+                if not self._sched_csv_initialized:
+                    with open(self._sched_csv_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(
+                            [
+                                "step",
+                                "batch_size",
+                                "is_prefill",
+                                "extend_sum",
+                                "extend_max",
+                                "forward_ms",
+                                "e2e_ms",
+                                "forward_mean",
+                                "forward_p95",
+                                "forward_p99",
+                                "forward_max",
+                                "e2e_mean",
+                                "e2e_p95",
+                                "e2e_p99",
+                                "e2e_max",
+                            ]
+                        )
+                    self._sched_csv_initialized = True
+                with open(self._sched_csv_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(
+                        [
+                            self._sched_step,
+                            batch.size,
+                            int(batch.is_prefill),
+                            extend_tokens,
+                            max_extend,
+                            forward_ms,
+                            e2e_ms,
+                            fs[0],
+                            fs[1],
+                            fs[2],
+                            fs[3],
+                            es[0],
+                            es[1],
+                            es[2],
+                            es[3],
+                        ]
+                    )
+
         return forward_output
 
 

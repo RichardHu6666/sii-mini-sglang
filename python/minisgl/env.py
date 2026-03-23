@@ -67,6 +67,26 @@ class EnvClassSingleton:
     # backend runtime
     FLASHINFER_USE_TENSOR_CORES = EnvOption()
     DISABLE_OVERLAP_SCHEDULING = EnvBool(False)
+    EP_PROFILE = EnvBool(False)
+    EP_PROFILE_INTERVAL = EnvInt(50)
+    # EP small-packet path is fully opt-in by default.
+    # Enable MINISGL_EP_SMALL_PACKET_ENABLE first, then tune thresholds.
+    EP_SMALL_PACKET_ENABLE = EnvBool(False)
+    EP_SMALL_PACKET_THRESHOLD = EnvInt(0)
+    EP_SMALL_PACKET_SYNC = EnvBool(True)
+    # P2 scheduler overlap controls (all disabled/safe by default).
+    P2_OVERLAP_ENABLE = EnvBool(False)
+    P2_PREFILL_BURST = EnvInt(1)
+    P2_SHORT_REQ_MAX_TOKENS = EnvInt(64)
+    P2_MAX_WAIT_MS = EnvInt(30)
+    # Cap decode starvation and only allow small prefill while decode is runnable.
+    P2_DECODE_MAX_GAP_STEPS = EnvInt(0)
+    P2_PREFILL_MAX_EXTEND_WHEN_DECODE = EnvInt(256)
+    # Decode-first policy controls for P2.
+    P2_DECODE_RUN_STEPS_BEFORE_PREFILL = EnvInt(16)
+    P2_PREFILL_SLICE_BUDGET = EnvInt(128)
+    P2_GOVERNOR_ENABLE = EnvBool(True)
+    P2_DECODE_TPS_MIN = EnvFloat(24.0)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     def __new__(cls):

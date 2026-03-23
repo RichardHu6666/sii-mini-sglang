@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import glob
 import re
-from typing import Dict, Iterator, Tuple
+from typing import Dict, Iterator, Set, Tuple
 
 import safetensors
 import torch
-from minisgl.distributed import get_tp_info
+from minisgl.distributed import get_ep_info, get_tp_info
 from minisgl.utils import cached_load_hf_config, div_ceil, download_hf_weight
 from tqdm import tqdm
 
@@ -28,11 +28,18 @@ _SLOT_NAMES = {
     ".gate_proj": "gate",
     ".up_proj": "up",
 }
+
+_EXPERT_KEY_RE = re.compile(r"experts\.(\d+)\.")
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
-
-def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
-    """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
+# 权重分割，从完整权重中提取某个rank需要的部分
+def _shard_tensor(
+    key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int, ep_size: int = 1
+) -> torch.Tensor:
+    # ep权重
+    if _EXPERT_KEY_RE.search(key) and ep_size > 1:
+        return value
+    # dim0分割 输出维度
     if any(key.count(sub) for sub in _SPLIT_DIM_0):
         is_kv_proj = any(key.count(sub) for sub in (".k_proj", ".v_proj"))
         if is_kv_proj and num_kv_heads is not None and num_kv_heads < n:
@@ -40,28 +47,50 @@ def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: i
             head_idx = r * num_kv_heads // n
             return value[head_idx * head_dim : (head_idx + 1) * head_dim].clone()
         return value.chunk(n, dim=0)[r].clone()
+    # dim1分割 输入维度
     elif any(key.count(sub) for sub in _SPLIT_DIM_1):
         return value.chunk(n, dim=1)[r].clone()
+    # embedding和lm head
     elif key.count("lm_head") or key.count("embed_tokens"):
         num_embeddings = value.shape[0]
         num_embeddings_per_partition = div_ceil(num_embeddings, n)
         vocab_start_idx = r * num_embeddings_per_partition
         vocab_end_idx = min((r + 1) * num_embeddings_per_partition, num_embeddings)
         return value[vocab_start_idx:vocab_end_idx, :].clone()
+    # 无分割
     else:
         return value
 
-
+# 权重融合
 def _get_merge_info(key: str):
-    """If key belongs to a merge group, return (merged_key, slot, all_slots). Else None."""
     for suffix, (fused_suffix, slots) in _MERGE_GROUPS.items():
         if key.count(suffix):
             return key.replace(suffix, fused_suffix), _SLOT_NAMES[suffix], slots
     return None
 
+# ep权重跳过集合
+def _build_ep_skip_set(files: list[str], ep_size: int) -> Tuple[Set[str], int]:
+    ep_info = get_ep_info()
+    max_idx = -1
+    expert_keys: list[tuple[str, int]] = []
+    for file in files:
+        with safetensors.safe_open(file, framework="pt") as f:
+            for name in f.keys():
+                m = _EXPERT_KEY_RE.search(name)
+                if m:
+                    idx = int(m.group(1))
+                    max_idx = max(max_idx, idx)
+                    expert_keys.append((name, idx))
+    if max_idx < 0:
+        return set(), 0
 
+    num_local = (max_idx + 1) // ep_size
+    local_start = ep_info.rank * num_local
+    skip = {name for name, idx in expert_keys if not (local_start <= idx < local_start + num_local)}
+    return skip, local_start
+
+# 权重堆叠信息
 def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
-    """Map an expert-scoped checkpoint key to the packed runtime key."""
     match = _EXPERT_PATTERN.match(key)
     if match is None:
         return None
@@ -71,10 +100,10 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
         packed_name = packed_name.removesuffix(".weight")
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
-
-def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
-    """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
-    and on device. Peak CPU memory: one full tensor + a small merge buffer."""
+# 主权重加载
+def load_weight(
+    model_path: str, device: torch.device, ep_size: int = 1
+) -> Iterator[Tuple[str, torch.Tensor]]:
     from .config import ModelConfig
 
     model_folder = download_hf_weight(model_path)
@@ -83,22 +112,39 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
-    # Buffer for merge groups: merged_key -> {slot: tensor}
+    skip_keys: Set[str] = set()
+    ep_local_start = 0
+    if ep_size > 1:
+        skip_keys, ep_local_start = _build_ep_skip_set(files, ep_size)
+
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
+    num_local_experts = config.num_experts // ep_size if ep_size > 1 else config.num_experts
+
     for file in tqdm(files, desc="Loading weights", disable=not tp_info.is_primary()):
         with safetensors.safe_open(file, framework="pt", device=str(device)) as f:
             for name in f.keys():
-                # Strip multimodal wrapper prefix, skip vision/projector weights
+                if name in skip_keys:
+                    continue
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
                     continue
+
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
-                tensor = _shard_tensor(name, raw, tp_info.rank, tp_info.size, config.num_kv_heads)
+                tensor = _shard_tensor(
+                    name, raw, tp_info.rank, tp_info.size, config.num_kv_heads, ep_size
+                )
                 del raw
 
-                if (info := _get_merge_info(name)) is None:
-                    out = (name, tensor)
+                out_name = name
+                if ep_size > 1:
+                    m = _EXPERT_KEY_RE.search(name)
+                    if m:
+                        local_idx = int(m.group(1)) - ep_local_start
+                        out_name = name[: m.start(1)] + str(local_idx) + name[m.end(1) :]
+
+                if (info := _get_merge_info(out_name)) is None:
+                    out = (out_name, tensor)
                 else:
                     merged_key, slot, all_slots = info
                     merge_buf.setdefault(merged_key, {})[slot] = tensor
@@ -112,12 +158,12 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     packed_key, expert_idx = expert_info
                     slots = expert_buf.setdefault(packed_key, {})
                     slots[expert_idx] = out[1]
-                    if len(slots) != config.num_experts:
+                    if len(slots) != num_local_experts:
                         continue
-                    experts = [slots[idx] for idx in range(config.num_experts)]
+                    experts = [slots[idx] for idx in range(num_local_experts)]
                     del expert_buf[packed_key]
                     yield packed_key, torch.stack(experts, dim=0)
-                else:  # Normal dense model
+                else:
                     yield out[0], out[1]
 
     assert not merge_buf, f"Incomplete merge groups in checkpoint: {list(merge_buf.keys())}"
