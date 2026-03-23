@@ -137,8 +137,10 @@ class EPMoe(BaseMoeBackend):
         num_local_experts = w1.shape[0]
         num_pairs = num_tokens * topk
         small_packet_threshold = int(ENV.EP_SMALL_PACKET_THRESHOLD.value)
+        small_packet_enabled = bool(ENV.EP_SMALL_PACKET_ENABLE) or small_packet_threshold > 0
         use_small_packet_sync = (
-            small_packet_threshold > 0
+            small_packet_enabled
+            and small_packet_threshold > 0
             and num_pairs <= small_packet_threshold
             and bool(ENV.EP_SMALL_PACKET_SYNC)
         )
