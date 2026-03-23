@@ -74,6 +74,7 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
+        self._p2_prefill_streak = 0
 
         # P0 observability for scheduler-level behavior.
         self._sched_step = 0
@@ -228,11 +229,55 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # P2 minimal overlap policy (default disabled):
+        # interleave decode with prefill bursts and prioritize short/urgent requests.
+        p2_enable = bool(ENV.P2_OVERLAP_ENABLE)
+        short_req_tokens = max(int(ENV.P2_SHORT_REQ_MAX_TOKENS.value), 1)
+        max_wait_ms = max(int(ENV.P2_MAX_WAIT_MS.value), 0)
+
+        if not p2_enable:
+            batch = (
+                self.prefill_manager.schedule_next_batch(self.prefill_budget)
+                or self.decode_manager.schedule_next_batch()
+            )
+            return self._prepare_batch(batch) if batch else None
+
+        prefill_runnable = self.prefill_manager.runnable
+        decode_runnable = self.decode_manager.runnable
+        prefill_burst = max(int(ENV.P2_PREFILL_BURST.value), 1)
+
+        batch = None
+        if prefill_runnable and decode_runnable:
+            # Run at most N prefill batches consecutively before one decode batch.
+            if self._p2_prefill_streak >= prefill_burst:
+                batch = self.decode_manager.schedule_next_batch(
+                    short_remain_threshold=short_req_tokens,
+                    max_wait_ms=max_wait_ms,
+                )
+                self._p2_prefill_streak = 0
+            else:
+                batch = self.prefill_manager.schedule_next_batch(
+                    self.prefill_budget,
+                    short_output_threshold=short_req_tokens,
+                    max_wait_ms=max_wait_ms,
+                )
+                if batch is not None:
+                    self._p2_prefill_streak += 1
+        elif prefill_runnable:
+            batch = self.prefill_manager.schedule_next_batch(
+                self.prefill_budget,
+                short_output_threshold=short_req_tokens,
+                max_wait_ms=max_wait_ms,
+            )
+            if batch is not None:
+                self._p2_prefill_streak += 1
+        elif decode_runnable:
+            batch = self.decode_manager.schedule_next_batch(
+                short_remain_threshold=short_req_tokens,
+                max_wait_ms=max_wait_ms,
+            )
+            self._p2_prefill_streak = 0
+
         return self._prepare_batch(batch) if batch else None
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:

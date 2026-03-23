@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Tuple
 
@@ -119,13 +120,37 @@ class PrefillManager:
     table_manager: TableManager
     decode_manager: DecodeManager
     pending_list: List[PendingReq] = field(default_factory=list)
+    _pending_enqueued_at: dict[int, float] = field(default_factory=dict)
 
     def add_one_req(self, req: UserMsg) -> None:
         self.pending_list.append(PendingReq(req.uid, req.input_ids, req.sampling_params))
+        self._pending_enqueued_at[req.uid] = time.perf_counter()
 
-    def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
+    def _reorder_pending(self, short_output_threshold: int, max_wait_ms: int) -> None:
+        if len(self.pending_list) <= 1:
+            return
+        now = time.perf_counter()
+        wait_s = max(max_wait_ms, 0) / 1000.0
+
+        def _key(req: PendingReq) -> tuple[int, int, int]:
+            enq_ts = self._pending_enqueued_at.get(req.uid, now)
+            is_urgent = int((now - enq_ts) >= wait_s)
+            is_short = int(req.output_len <= short_output_threshold)
+            # urgent first, then short, then old first
+            return (-is_urgent, -is_short, int(enq_ts * 1_000_000))
+
+        self.pending_list.sort(key=_key)
+
+    def schedule_next_batch(
+        self,
+        prefill_budget: int,
+        short_output_threshold: int = 64,
+        max_wait_ms: int = 30,
+    ) -> Batch | None:
         if len(self.pending_list) == 0:
             return None
+
+        self._reorder_pending(short_output_threshold, max_wait_ms)
 
         # estimated offset due to in-flight decode
         adder = PrefillAdder(
@@ -147,13 +172,18 @@ class PrefillManager:
                 break  # We cannot add more requests
         if len(reqs) == 0:
             return None
+        taken = self.pending_list[: len(reqs)]
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
+        for pending_req in taken:
+            if pending_req.chunked_req is None:
+                self._pending_enqueued_at.pop(pending_req.uid, None)
         return Batch(reqs=reqs, phase="prefill")
 
     def abort_req(self, uid: int) -> Req | None:
         for i, req in enumerate(self.pending_list):
             if req.uid == uid:
                 self.pending_list.pop(i)
+                self._pending_enqueued_at.pop(uid, None)
                 return req.chunked_req
         return None
 
