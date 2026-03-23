@@ -87,7 +87,7 @@ class _LinearTPImpl(BaseOP):
                 item = state_dict.pop(bias_key)
                 assert isinstance(item, torch.Tensor)
                 assert item.shape == (self.local_output_size,)
-                self.bias = bias
+                self.bias = item
 
         if not _internal and state_dict:
             pass  # Don't raise error for unused keys at this level

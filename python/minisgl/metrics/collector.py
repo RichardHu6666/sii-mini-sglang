@@ -187,6 +187,7 @@ class MetricsCollector:
 
         # Queued requests (tracked externally)
         self._queued_count: int = 0
+        self._active_count: int = 0  # Actively processing requests (decode phase)
 
         # KV cache metrics
         self._num_used_tokens: int = 0
@@ -270,6 +271,10 @@ class MetricsCollector:
         """Set the current number of queued requests."""
         self._queued_count = count
 
+    def set_active_count(self, count: int) -> None:
+        """Set the current number of actively processing requests (decode phase)."""
+        self._active_count = count
+
     def get_snapshot(self) -> MetricsSnapshot:
         """Get a snapshot of current metrics."""
         now = time.monotonic()
@@ -312,9 +317,11 @@ class MetricsCollector:
             except Exception:
                 pass
 
+        # running_requests: requests actually being processed (decode phase)
+        # queued_requests: requests waiting in pending list
         return MetricsSnapshot(
             timestamp=now,
-            running_requests=len(self._active_requests),
+            running_requests=self._active_count,
             queued_requests=self._queued_count,
             completed_requests=self._total_completed,
             total_input_tokens=self._total_input_tokens,

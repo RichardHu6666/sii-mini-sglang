@@ -151,21 +151,15 @@ class MetricsSampler:
 
         # Metric groupings for combined plots
         # Note: Metrics in the same group should have similar scales for meaningful visualization
+        # running_requests from server is now active_requests (actually being processed)
         metric_groups = {
             "request_counts": [
-                ("minisgl_running_requests", "Running", "gauge"),
+                ("minisgl_running_requests", "Decoding", "gauge"),
                 ("minisgl_queued_requests", "Queued", "gauge"),
-                ("minisgl_completed_requests", "Completed", "counter"),
-            ],
-            "token_usage": [
-                ("token_usage_raw", "Total Tokens", "counter"),
             ],
             "kv_cache_tokens": [
                 ("minisgl_num_used_tokens", "Used Tokens", "gauge"),
                 ("minisgl_max_total_num_tokens", "Max Capacity", "gauge"),
-            ],
-            "kv_cache_ratio": [
-                ("minisgl_token_usage", "Usage Ratio", "gauge"),
             ],
             "throughput": [
                 ("minisgl_output_throughput", "Throughput", "gauge"),
@@ -177,18 +171,15 @@ class MetricsSampler:
 
         # Color palette for different metric categories
         colors = {
-            "request_counts": ["#2E86AB", "#E94F37", "#44AF69"],
-            "token_usage": ["#F6BD60"],
+            "request_counts": ["#2E86AB", "#E94F37"],  # blue for active, red for queued
             "kv_cache_tokens": ["#845EC2", "#D65DB1"],
-            "kv_cache_ratio": ["#FF9671"],
             "throughput": ["#00C9A7"],
             "cache_hit_rate": ["#9B5DE5"],
         }
 
-        # Pre-calculate token_usage_raw if not present
+        # Pre-calculate computed metrics (not needed now, kept for future extensions)
         for s in self.samples:
-            if "token_usage_raw" not in s:
-                s["token_usage_raw"] = s.get("minisgl_total_input_tokens", 0) + s.get("minisgl_total_output_tokens", 0)
+            pass
 
         # Filter to groups that have data
         available_groups = {}
@@ -213,9 +204,7 @@ class MetricsSampler:
         # Group titles
         group_titles = {
             "request_counts": "Request Counts",
-            "token_usage": "Token Usage",
             "kv_cache_tokens": "KV Cache Token Counts",
-            "kv_cache_ratio": "KV Cache Usage Ratio",
             "throughput": "Throughput",
             "cache_hit_rate": "Cache Hit Rate",
         }
@@ -267,8 +256,12 @@ async def run_with_semaphore(
     Run benchmark with dynamic concurrency control.
     Keeps at most `concurrency` requests running at any time.
     When one finishes, immediately start the next one.
+
+    TTFT is measured from when the request is scheduled (claimed from the queue)
+    to when the first token is received, including any queuing delay on the server.
     """
     import asyncio
+    import time
 
     results: List[RawResult] = []
     next_index = 0  # Next prompt index to schedule
@@ -276,7 +269,7 @@ async def run_with_semaphore(
     lock = asyncio.Lock()  # Shared lock for task distribution
     completed = 0
 
-    async def run_one(index: int) -> RawResult:
+    async def run_one(index: int, start_time: float) -> RawResult:
         """Run a single request."""
         nonlocal completed
         prompt = prompts[index]
@@ -285,7 +278,13 @@ async def run_with_semaphore(
         completed += 1
         if completed % 10 == 0 or completed == total:
             logger.info(f"Progress: {completed}/{total} requests completed")
-        return result
+        # Replace the first tic with our scheduled start time to include queuing delay
+        return RawResult(
+            input_len=result.input_len,
+            output_len=result.output_len,
+            message=result.message,
+            tics=[start_time] + result.tics[1:],
+        )
 
     async def worker():
         """Worker that processes tasks from the shared queue."""
@@ -297,9 +296,11 @@ async def run_with_semaphore(
                     return
                 current_index = next_index
                 next_index += 1
+                # Record the time when this request is scheduled
+                schedule_time = time.perf_counter()
 
             # Run the request (outside lock to allow concurrency)
-            result = await run_one(current_index)
+            result = await run_one(current_index, schedule_time)
             results.append(result)
 
     # Start worker tasks - use concurrency number of workers

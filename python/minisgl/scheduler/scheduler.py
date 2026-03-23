@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -67,6 +68,8 @@ class Scheduler(SchedulerIOMixin):
         # Initialize metrics collector
         self.metrics_collector = MetricsCollector()
         self._metrics_counter = 0
+        self._last_log_time = time.monotonic()
+        self._log_interval = 10.0  # Log every 10 seconds
 
         # Set up KV cache info callbacks for metrics
         self.metrics_collector.set_kv_cache_info(
@@ -121,7 +124,25 @@ class Scheduler(SchedulerIOMixin):
                 ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(last_data)
+        self._maybe_log_status()
         return ongoing_data
+
+    def _maybe_log_status(self) -> None:
+        """Periodically log scheduler status including running/queued requests."""
+        now = time.monotonic()
+        if now - self._last_log_time >= self._log_interval:
+            snapshot = self.metrics_collector.get_snapshot()
+            # running_requests = active requests (actually being processed)
+            # queued_requests = requests waiting in pending list
+            logger.info(
+                f"Scheduler status: "
+                f"running={snapshot.running_requests} (active), "
+                f"queued={snapshot.queued_requests} (pending), "
+                f"completed={snapshot.completed_requests}, "
+                f"throughput={snapshot.throughput_tokens_per_sec:.1f} tokens/s, "
+                f"avg_ttft={snapshot.avg_ttft*1000:.1f}ms"
+            )
+            self._last_log_time = now
 
     def normal_loop(self) -> None:
         blocking = not (self.prefill_manager.runnable or self.decode_manager.runnable)
@@ -134,6 +155,7 @@ class Scheduler(SchedulerIOMixin):
             ongoing_data = (forward_input, self._forward(forward_input))
 
         self._process_last_data(ongoing_data)
+        self._maybe_log_status()
 
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
@@ -186,14 +208,17 @@ class Scheduler(SchedulerIOMixin):
                     new_finished_reqs.add(req)
                     # Record metrics: request completed
                     self.metrics_collector.request_completed(req.uid)
-                elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
+                elif batch.is_prefill:  # for prefill, non-chunk req
+                    # Add request to decode manager after prefill completes
+                    self.decode_manager.running_reqs.add(req)
                     self.cache_manager.cache_req(req, finished=False)
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
 
-        # Update queued count and periodically send metrics
+        # Update queued count and active count, periodically send metrics
         self.metrics_collector.set_queued_count(len(self.prefill_manager.pending_list))
+        self.metrics_collector.set_active_count(len(self.decode_manager.running_reqs))
         self._metrics_counter += 1
         if self._metrics_counter >= 10:  # Send metrics every 10 batches
             self._send_metrics()
@@ -298,7 +323,10 @@ class Scheduler(SchedulerIOMixin):
         batch.input_ids = self.token_pool[input_mapping]
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        # Only update running_reqs for decode batch
+        # Prefill requests should be added to running_reqs after they finish prefill
+        if batch.is_decode:
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
 
