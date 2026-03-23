@@ -132,44 +132,6 @@ def set_queued_count(self, count: int) -> None:
 
 ---
 
-#### 指标关系与正确性
-
-**修复前的问题**：
-```
-running_requests + queued_requests > 并发数  # 异常！
-```
-
-**根本原因**：`filter_reqs()` 在 prefill batch forward 时也被无条件调用，导致 prefill 请求被错误地加入 `decode_manager.running_reqs`，造成重复计数。
-
-**修复方案**：
-1. `_forward()` 中只在 batch 为 decode 时调用 `filter_reqs()`
-2. `_process_last_data()` 中在 prefill 完成后显式将请求加入 `running_reqs`
-
-**修复后的指标关系**：
-```
-running_requests + queued_requests <= 并发数  # 正常
-```
-
-其中差值为"正在 prefill 中"的请求数（通常很小，因为 prefill 是批量的，速度很快）。
-
----
-
-#### minisgl_completed_requests (counter)
-
-**含义**：自服务启动以来完成的请求总数
-
-**采集点**：`MetricsCollector._total_completed` 计数器
-
-```python
-# collector.py: request_completed()
-def request_completed(self, uid: int) -> None:
-    if uid in self._active_requests:
-        metrics = self._active_requests.pop(uid)
-        self._completed_metrics.append(metrics)
-        self._total_completed += 1  # 累加计数器
-```
-
----
 
 ### 2.2 Token 指标
 
@@ -192,24 +154,6 @@ def request_arrived(self, uid: int, num_input_tokens: int, ...) -> None:
 
 ---
 
-#### minisgl_total_output_tokens (counter)
-
-**含义**：自服务启动以来生成的输出 token 总数
-
-**采集点**：`request_completed()` 时累加
-
-```python
-# collector.py: request_output_token()
-def request_output_token(self, uid: int) -> None:
-    if uid in self._active_requests:
-        req = self._active_requests[uid]
-        req.num_output_tokens += 1  # 记录单个请求的 output token
-
-# collector.py: request_completed()
-def request_completed(self, uid: int) -> None:
-    ...
-    self._total_output_tokens += metrics.num_output_tokens  # 累加到全局
-```
 
 ---
 
@@ -238,51 +182,6 @@ def _calculate_throughput(self) -> float:
 - 每次生成 output token 时记录时间戳和数量
 - 使用 `deque(maxlen=1000)` 作为滑动窗口
 - 吞吐量 = 窗口内总 token 数 / 窗口时间跨度
-
----
-
-### 2.3 延迟指标 (TTFT)
-
-#### minisgl_ttft_avg / p50 / p90 / p99 (gauge)
-
-**含义**：Time To First Token 的统计值
-
-**采集流程**：
-
-```python
-# 1. 请求到达时记录 arrival_time
-# collector.py: request_arrived()
-self._active_requests[uid] = RequestMetrics(
-    uid=uid,
-    arrival_time=now,  # 记录到达时间
-)
-
-# 2. 生成第一个 token 时记录 first_token_time
-# collector.py: request_first_token()
-def request_first_token(self, uid: int) -> None:
-    if uid in self._active_requests:
-        req = self._active_requests[uid]
-        req.first_token_time = time.monotonic()
-
-# 3. 请求完成时计算 TTFT
-# RequestMetrics 属性
-@property
-def ttft(self) -> Optional[float]:
-    if self.first_token_time is None:
-        return None
-    return self.first_token_time - self.arrival_time
-
-# 4. 计算统计值
-# collector.py: get_snapshot()
-ttft_values = [req.ttft for req in self._completed_metrics if req.ttft is not None]
-ttft_values.sort()
-avg_ttft = sum(ttft_values) / len(ttft_values) if ttft_values else 0.0
-p50_ttft = self._percentile(ttft_values, 50)
-p90_ttft = self._percentile(ttft_values, 90)
-p99_ttft = self._percentile(ttft_values, 99)
-```
-
-**TTFT 定义**：从请求提交到第一个输出 token 生成的时间间隔
 
 ---
 
@@ -322,13 +221,6 @@ if self._get_used_tokens_fn and self._get_max_tokens_fn:
 
 ---
 
-#### minisgl_token_usage (gauge)
-
-**含义**：KV cache 使用率
-
-**计算逻辑**：`num_used_tokens / max_total_num_tokens`
-
----
 
 ### 2.5 Cache 命中指标
 
@@ -368,84 +260,6 @@ def cache_hit_rate(self) -> float:
 
 ---
 
-#### minisgl_cache_hits / minisgl_cache_misses (counter)
-
-**含义**：前缀缓存命中/未命中次数
-
-**采集点**：同上
-
----
-
-### 2.6 排队时间指标
-
-#### minisgl_queue_time_avg / p50 / p99 (gauge)
-
-**含义**：请求在队列中等待的时间统计
-
-**采集流程**：
-
-```python
-# 1. 请求到达时记录 arrival_time
-# collector.py: request_arrived()
-self._active_requests[uid] = RequestMetrics(
-    uid=uid,
-    arrival_time=now,
-)
-
-# 2. 生成第一个 token 时计算 queue_time
-# collector.py: request_first_token()
-def request_first_token(self, uid: int) -> None:
-    if uid in self._active_requests:
-        req = self._active_requests[uid]
-        req.first_token_time = time.monotonic()
-        req.queue_time = req.first_token_time - req.arrival_time
-
-# 3. 计算统计值
-# collector.py: get_snapshot()
-queue_times = [req.queue_time for req in self._completed_metrics if req.queue_time > 0]
-queue_times.sort()
-avg_queue_time = sum(queue_times) / len(queue_times) if queue_times else 0.0
-p50_queue_time = self._percentile(queue_times, 50)
-p99_queue_time = self._percentile(queue_times, 99)
-```
-
-**Queue Time 定义**：从请求到达 Scheduler 到开始处理（生成第一个 token）的时间
-
----
-
-## 3. Prometheus 格式输出
-
-API Server 将 `MetricsState` 转换为 Prometheus exposition format：
-
-```python
-# api_server.py: MetricsState.to_prometheus()
-def to_prometheus(self) -> str:
-    lines = [
-        "# HELP minisgl_running_requests Number of running requests",
-        "# TYPE minisgl_running_requests gauge",
-        f"minisgl_running_requests {self.running_requests}",
-        "# HELP minisgl_queued_requests Number of queued requests",
-        "# TYPE minisgl_queued_requests gauge",
-        f"minisgl_queued_requests {self.queued_requests}",
-        # ... 其他指标
-    ]
-    return "\n".join(lines) + "\n"
-```
-
-输出示例：
-```
-# HELP minisgl_running_requests Number of running requests
-# TYPE minisgl_running_requests gauge
-minisgl_running_requests 64
-# HELP minisgl_output_throughput Output throughput in tokens per second
-# TYPE minisgl_output_throughput gauge
-minisgl_output_throughput 332.54
-# HELP minisgl_completed_requests Total number of completed requests
-# TYPE minisgl_completed_requests counter
-minisgl_completed_requests 65
-```
-
----
 
 ## 4. 关键设计决策
 
@@ -475,19 +289,6 @@ if self._metrics_counter >= 10:  # 每 10 个 batch 发送一次 metrics
     self._metrics_counter = 0
 ```
 
-### 4.3 为什么指标计算在 Collector 端完成？
-
-- 减少数据传输量（传输统计值而非原始数据）
-- 保持 Scheduler 和 API Server 解耦
-- API Server 只负责暴露，不负责计算
-
-### 4.4 滑动窗口 vs 固定时间窗口
-
-- 使用固定大小的 `deque(maxlen=1000)` 作为滑动窗口
-- 避免维护定时器，简化实现
-- 自适应吞吐量计算
-
----
 
 ## 5. 相关文件
 
@@ -748,76 +549,6 @@ def cache_hit_rate(self) -> float:
 **采集点**：同上
 
 ---
-
-### 2.6 排队时间指标
-
-#### minisgl_queue_time_avg / p50 / p99 (gauge)
-
-**含义**：请求在队列中等待的时间统计
-
-**采集流程**：
-
-```python
-# 1. 请求到达时记录 arrival_time
-# collector.py: request_arrived()
-self._active_requests[uid] = RequestMetrics(
-    uid=uid,
-    arrival_time=now,
-)
-
-# 2. 生成第一个 token 时计算 queue_time
-# collector.py: request_first_token()
-def request_first_token(self, uid: int) -> None:
-    if uid in self._active_requests:
-        req = self._active_requests[uid]
-        req.first_token_time = time.monotonic()
-        req.queue_time = req.first_token_time - req.arrival_time
-
-# 3. 计算统计值
-# collector.py: get_snapshot()
-queue_times = [req.queue_time for req in self._completed_metrics if req.queue_time > 0]
-queue_times.sort()
-avg_queue_time = sum(queue_times) / len(queue_times) if queue_times else 0.0
-p50_queue_time = self._percentile(queue_times, 50)
-p99_queue_time = self._percentile(queue_times, 99)
-```
-
-**Queue Time 定义**：从请求到达 Scheduler 到开始处理（生成第一个 token）的时间
-
----
-
-## 3. Prometheus 格式输出
-
-API Server 将 `MetricsState` 转换为 Prometheus exposition format：
-
-```python
-# api_server.py: MetricsState.to_prometheus()
-def to_prometheus(self) -> str:
-    lines = [
-        "# HELP minisgl_running_requests Number of running requests",
-        "# TYPE minisgl_running_requests gauge",
-        f"minisgl_running_requests {self.running_requests}",
-        "# HELP minisgl_queued_requests Number of queued requests",
-        "# TYPE minisgl_queued_requests gauge",
-        f"minisgl_queued_requests {self.queued_requests}",
-        # ... 其他指标
-    ]
-    return "\n".join(lines) + "\n"
-```
-
-输出示例：
-```
-# HELP minisgl_running_requests Number of running requests
-# TYPE minisgl_running_requests gauge
-minisgl_running_requests 64
-# HELP minisgl_output_throughput Output throughput in tokens per second
-# TYPE minisgl_output_throughput gauge
-minisgl_output_throughput 332.54
-# HELP minisgl_completed_requests Total number of completed requests
-# TYPE minisgl_completed_requests counter
-minisgl_completed_requests 65
-```
-
 ---
 
 ## 4. 关键设计决策

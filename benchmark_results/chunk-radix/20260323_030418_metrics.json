@@ -1,0 +1,44 @@
+{
+  "config": {
+    "concurrency": 16,
+    "input_length": 16000,
+    "output_length": 1024,
+    "seed": 42,
+    "model": "/inspire/ssd/project/mianxiangdayuyanmoxing/public/Qwen2.5-14B-Instruct",
+    "timestamp": "20260323_030418",
+    "prompts_source": "random",
+    "prefix_ratio": 0.5,
+    "total_requests": 32
+  },
+  "results": {
+    "num_requests": 32,
+    "total_tokens": 24067,
+    "duration_seconds": 51.121090408880264,
+    "request_throughput": 0.6259647387028596,
+    "token_throughput": 470.78416769880386,
+    "ttft_seconds": {
+      "avg": 2.791887281149684,
+      "min": 0.5439685701858252,
+      "max": 8.558585624909028,
+      "p50": 0.9963625194504857,
+      "p90": 7.203041233960539,
+      "p99": 8.462447845239659
+    },
+    "tpot_seconds": {
+      "avg": 0.027385121912894828,
+      "min": 9.010103531181812e-05,
+      "max": 7.675391949946061,
+      "p50": 0.020863058976829052,
+      "p90": 0.021333830943331123,
+      "p99": 0.47305753730703143
+    },
+    "e2e_latency_seconds": {
+      "avg": 23.360681192913034,
+      "min": 12.96001505292952,
+      "max": 36.94031248311512,
+      "p50": 22.129011509590782,
+      "p90": 32.72937398657668,
+      "p99": 36.64140264534625
+    }
+  }
+}
