@@ -79,6 +79,9 @@ class EnvClassSingleton:
     P2_PREFILL_BURST = EnvInt(1)
     P2_SHORT_REQ_MAX_TOKENS = EnvInt(64)
     P2_MAX_WAIT_MS = EnvInt(30)
+    # Cap decode starvation and only allow small prefill while decode is runnable.
+    P2_DECODE_MAX_GAP_STEPS = EnvInt(0)
+    P2_PREFILL_MAX_EXTEND_WHEN_DECODE = EnvInt(256)
     PYNCCL_MAX_BUFFER_SIZE = EnvMem(1024**3)
 
     def __new__(cls):

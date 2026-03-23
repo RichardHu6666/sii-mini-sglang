@@ -75,6 +75,7 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_budget = config.max_extend_tokens
         # self.config = config
         self._p2_prefill_streak = 0
+        self._p2_decode_gap_steps = 0
 
         # P0 observability for scheduler-level behavior.
         self._sched_step = 0
@@ -245,24 +246,43 @@ class Scheduler(SchedulerIOMixin):
         prefill_runnable = self.prefill_manager.runnable
         decode_runnable = self.decode_manager.runnable
         prefill_burst = max(int(ENV.P2_PREFILL_BURST.value), 1)
+        decode_max_gap = max(int(ENV.P2_DECODE_MAX_GAP_STEPS.value), 0)
+        prefill_cap_when_decode = max(int(ENV.P2_PREFILL_MAX_EXTEND_WHEN_DECODE.value), 0)
 
         batch = None
         if prefill_runnable and decode_runnable:
-            # Run at most N prefill batches consecutively before one decode batch.
+            # Protect decode latency first; allow only small prefill inserts.
+            should_force_decode = self._p2_decode_gap_steps >= decode_max_gap
             if self._p2_prefill_streak >= prefill_burst:
+                should_force_decode = True
+
+            if should_force_decode:
                 batch = self.decode_manager.schedule_next_batch(
                     short_remain_threshold=short_req_tokens,
                     max_wait_ms=max_wait_ms,
                 )
                 self._p2_prefill_streak = 0
+                self._p2_decode_gap_steps = 0
             else:
+                effective_prefill_budget = self.prefill_budget
+                if prefill_cap_when_decode > 0:
+                    effective_prefill_budget = min(effective_prefill_budget, prefill_cap_when_decode)
                 batch = self.prefill_manager.schedule_next_batch(
-                    self.prefill_budget,
+                    effective_prefill_budget,
                     short_output_threshold=short_req_tokens,
                     max_wait_ms=max_wait_ms,
                 )
                 if batch is not None:
                     self._p2_prefill_streak += 1
+                    self._p2_decode_gap_steps += 1
+                else:
+                    # Fall back to decode if prefill cannot be scheduled under tight budget.
+                    batch = self.decode_manager.schedule_next_batch(
+                        short_remain_threshold=short_req_tokens,
+                        max_wait_ms=max_wait_ms,
+                    )
+                    self._p2_prefill_streak = 0
+                    self._p2_decode_gap_steps = 0
         elif prefill_runnable:
             batch = self.prefill_manager.schedule_next_batch(
                 self.prefill_budget,
@@ -271,12 +291,15 @@ class Scheduler(SchedulerIOMixin):
             )
             if batch is not None:
                 self._p2_prefill_streak += 1
+                if decode_runnable:
+                    self._p2_decode_gap_steps += 1
         elif decode_runnable:
             batch = self.decode_manager.schedule_next_batch(
                 short_remain_threshold=short_req_tokens,
                 max_wait_ms=max_wait_ms,
             )
             self._p2_prefill_streak = 0
+            self._p2_decode_gap_steps = 0
 
         return self._prepare_batch(batch) if batch else None
 
